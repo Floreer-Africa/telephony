@@ -240,5 +240,5 @@ fixtures = [
 
 default_log_clearing_doctypes = {
     "TP SMS Log": 90,
-    "TP SMS OTP": 7,
+    "TP OTP": 7,
 }

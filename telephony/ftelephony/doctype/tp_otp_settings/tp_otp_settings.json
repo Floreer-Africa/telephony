@@ -103,7 +103,7 @@
  "modified": "2026-08-05 08:22:40.145444",
  "modified_by": "Administrator",
  "module": "FTelephony",
- "name": "TP SMS Settings",
+ "name": "TP OTP Settings",
  "owner": "Administrator",
  "permissions": [
   {

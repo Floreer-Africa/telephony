@@ -3,11 +3,20 @@ from frappe import _
 from frappe.rate_limiter import rate_limit
 from frappe.utils import now_datetime
 
-from telephony.otp import create_otp_record, generate_otp_code, verify_otp_record
+from telephony.otp import (
+    clean_purpose,
+    create_otp_record,
+    generate_otp_code,
+    normalize_form_field,
+    verify_otp_record,
+)
 
 from .twilio_handler import Twilio
 
-SMS_ALLOWED_ROLES = {"System Manager", "TP Manager", "TP Agent"}
+# TP SMS Log is readable by TP Agent and retained for 90 days, so writing the
+# rendered OTP body there would undo hashing the code in TP OTP. Keep the
+# routing metadata (to/from/sid/status) and drop the body.
+REDACTED_MESSAGE = "[redacted]"
 
 
 def clean_phone_number(phone_number: str) -> str:
@@ -17,9 +26,9 @@ def clean_phone_number(phone_number: str) -> str:
 
 
 def get_sms_settings():
-    settings = frappe.get_cached_doc("TP SMS Settings")
+    settings = frappe.get_cached_doc("TP OTP Settings")
     if not settings.enabled:
-        frappe.throw(_("Please enable TP SMS Settings to send SMS."))
+        frappe.throw(_("Please enable SMS in TP OTP Settings to send SMS."))
     return settings
 
 
@@ -29,7 +38,7 @@ def create_sms_log(to, from_number, message, purpose, status, sid=None, error=No
             "doctype": "TP SMS Log",
             "to": to,
             "from": from_number,
-            "message": message,
+            "message": REDACTED_MESSAGE if purpose == "OTP" else message,
             "purpose": purpose,
             "status": status,
             "sid": sid,
@@ -39,13 +48,14 @@ def create_sms_log(to, from_number, message, purpose, status, sid=None, error=No
         }
     )
     log.insert(ignore_permissions=True)
-    frappe.db.commit()  # nosemgrep
     return log
 
 
 def dispatch_sms(to, message, purpose="General"):
     """Send an SMS via Twilio and log the result."""
     settings = get_sms_settings()
+    # NOTE: Twilio.connect() re-reads TP Twilio Settings uncached and decrypts
+    # api_secret on every call — one extra query plus a KDF per SMS.
     twilio = Twilio.connect()
     if not twilio:
         frappe.throw(_("Please enable and configure TP Twilio Settings to send SMS."))
@@ -58,9 +68,17 @@ def dispatch_sms(to, message, purpose="General"):
             to=to, from_=from_number, body=message
         )
     except Exception as e:
+        # This request is about to be rolled back, but the failure log is the
+        # audit trail for the send attempt. Discard the partial work first so
+        # nothing half-written (e.g. an unusable OTP row) survives, then
+        # persist the log on its own.
+        frappe.db.rollback()
         create_sms_log(to, from_number, message, purpose, "Failed", error=str(e))
         frappe.log_error(title=_("Failed to send SMS via Twilio"))
-        frappe.throw(_("Failed to send SMS: {0}").format(str(e)))
+        frappe.db.commit()  # nosemgrep: deliberate, see comment above
+        # The raw Twilio error carries account SIDs, the configured from-number
+        # and endpoint URLs; generate_otp is guest-callable, so keep it out.
+        frappe.throw(_("Could not send the SMS. Please try again later."))
 
     return create_sms_log(
         to, from_number, message, purpose, "Sent", sid=message_obj.sid
@@ -70,14 +88,15 @@ def dispatch_sms(to, message, purpose="General"):
 @frappe.whitelist(methods=["POST"])
 def send_sms(to: str, message: str):
     """Send a plain SMS. Restricted to telephony agents/managers."""
-    if not SMS_ALLOWED_ROLES & set(frappe.get_roles()):
-        frappe.throw(_("Not permitted"), frappe.PermissionError)
+    # Defer to the DocType's permissions so the role set stays configurable.
+    frappe.has_permission("TP SMS Log", "create", throw=True)
 
     log = dispatch_sms(to, message, purpose="General")
     return {"name": log.name, "status": log.status}
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])  # nosemgrep
+@normalize_form_field("phone_number", clean_phone_number)
 @rate_limit(key="phone_number", limit=5, seconds=10 * 60)
 def generate_otp(phone_number: str, purpose: str = "Verification"):
     """Generate an OTP and send it over SMS to the given phone number."""
@@ -86,32 +105,33 @@ def generate_otp(phone_number: str, purpose: str = "Verification"):
     if not phone_number:
         frappe.throw(_("Please provide a valid phone number."))
 
-    otp = generate_otp_code(settings.otp_length or 6)
-    expiry_seconds = settings.otp_expiry_in_seconds or 300
+    purpose = clean_purpose(purpose)
+    otp = generate_otp_code(settings.otp_length)
+    expiry_seconds = settings.otp_expiry_in_seconds
 
-    template = (
-        settings.otp_message_template
-        or "Your OTP is {otp}. It is valid for {expiry_minutes} minutes."
+    message = settings.otp_message_template.format(
+        otp=otp, expiry_minutes=max(1, expiry_seconds // 60)
     )
-    message = template.format(otp=otp, expiry_minutes=max(1, expiry_seconds // 60))
 
+    # Record first: if the send fails the whole request rolls back, so a user
+    # can never be left holding a code that has no record to verify against.
+    otp_doc = create_otp_record(phone_number, "SMS", purpose, otp, expiry_seconds)
     log = dispatch_sms(phone_number, message, purpose="OTP")
-    create_otp_record(
-        phone_number, "SMS", purpose, otp, expiry_seconds, notification_log=log.name
-    )
+    otp_doc.db_set("notification_log", log.name, update_modified=False)
 
-    response = {"sent": True, "expires_in": expiry_seconds}
-    if frappe.conf.developer_mode:
-        response["otp"] = otp
-    return response
+    return {"sent": True, "expires_in": expiry_seconds}
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])  # nosemgrep
+@normalize_form_field("phone_number", clean_phone_number)
 @rate_limit(key="phone_number", limit=10, seconds=10 * 60)
 def verify_otp(phone_number: str, otp: str, purpose: str = "Verification"):
     """Verify an OTP previously sent to the given phone number."""
     settings = get_sms_settings()
     phone_number = clean_phone_number(phone_number)
+    if not phone_number:
+        frappe.throw(_("Please provide a valid phone number."))
+
     return verify_otp_record(
-        phone_number, "SMS", otp, purpose, settings.otp_max_attempts or 5
+        phone_number, "SMS", otp, clean_purpose(purpose), settings.otp_max_attempts
     )

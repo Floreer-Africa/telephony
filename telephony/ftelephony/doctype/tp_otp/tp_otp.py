@@ -4,5 +4,5 @@
 from frappe.model.document import Document
 
 
-class TPSMSOTP(Document):
+class TPOTP(Document):
     pass

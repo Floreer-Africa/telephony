@@ -17,7 +17,7 @@
   "column_break_expiry",
   "expires_at",
   "verified_at",
-  "sms_log"
+  "notification_log"
  ],
  "fields": [
   {
@@ -37,7 +37,8 @@
    "in_standard_filter": 1,
    "label": "Recipient",
    "read_only": 1,
-   "reqd": 1
+   "reqd": 1,
+   "search_index": 1
   },
   {
    "default": "Verification",
@@ -46,6 +47,7 @@
    "in_list_view": 1,
    "in_standard_filter": 1,
    "label": "Purpose",
+   "length": 140,
    "read_only": 1
   },
   {
@@ -94,9 +96,9 @@
    "read_only": 1
   },
   {
-   "fieldname": "sms_log",
+   "fieldname": "notification_log",
    "fieldtype": "Link",
-   "label": "SMS Log",
+   "label": "Notification Log",
    "options": "TP SMS Log",
    "read_only": 1
   }
@@ -107,7 +109,7 @@
  "modified": "2026-08-05 08:22:40.145444",
  "modified_by": "Administrator",
  "module": "FTelephony",
- "name": "TP SMS OTP",
+ "name": "TP OTP",
  "naming_rule": "Random",
  "owner": "Administrator",
  "permissions": [
