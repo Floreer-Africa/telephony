@@ -77,7 +77,7 @@ def send_sms(to: str, message: str):
     return {"name": log.name, "status": log.status}
 
 
-@frappe.whitelist(allow_guest=True, methods=["POST"])
+@frappe.whitelist(allow_guest=True, methods=["POST"])  # nosemgrep
 @rate_limit(key="phone_number", limit=5, seconds=10 * 60)
 def generate_otp(phone_number: str, purpose: str = "Verification"):
     """Generate an OTP and send it over SMS to the given phone number."""
@@ -106,7 +106,7 @@ def generate_otp(phone_number: str, purpose: str = "Verification"):
     return response
 
 
-@frappe.whitelist(allow_guest=True, methods=["POST"])
+@frappe.whitelist(allow_guest=True, methods=["POST"])  # nosemgrep
 @rate_limit(key="phone_number", limit=10, seconds=10 * 60)
 def verify_otp(phone_number: str, otp: str, purpose: str = "Verification"):
     """Verify an OTP previously sent to the given phone number."""

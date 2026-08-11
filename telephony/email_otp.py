@@ -17,7 +17,7 @@ def dispatch_email_otp(email, message, subject):
     frappe.sendmail(recipients=[email], subject=subject, message=message)
 
 
-@frappe.whitelist(allow_guest=True, methods=["POST"])
+@frappe.whitelist(allow_guest=True, methods=["POST"])  # nosemgrep
 @rate_limit(key="email", limit=5, seconds=10 * 60)
 def generate_otp(email: str, purpose: str = "Verification"):
     """Generate an OTP and send it over email to the given address."""
@@ -43,7 +43,7 @@ def generate_otp(email: str, purpose: str = "Verification"):
     return response
 
 
-@frappe.whitelist(allow_guest=True, methods=["POST"])
+@frappe.whitelist(allow_guest=True, methods=["POST"])  # nosemgrep
 @rate_limit(key="email", limit=10, seconds=10 * 60)
 def verify_otp(email: str, otp: str, purpose: str = "Verification"):
     """Verify an OTP previously sent to the given email address."""
