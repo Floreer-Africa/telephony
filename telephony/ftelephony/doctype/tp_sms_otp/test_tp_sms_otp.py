@@ -72,8 +72,10 @@ class IntegrationTestTPSMSOTP(IntegrationTestCase):
     def test_sms_otp_generate_and_verify(self, mock_generate_code, mock_dispatch_sms):
         from telephony.twilio.sms import create_sms_log, generate_otp, verify_otp
 
-        mock_dispatch_sms.side_effect = lambda to, message, purpose="OTP": create_sms_log(
-            to, TEST_SMS_FROM_NUMBER, message, purpose, "Sent", sid="SM_test"
+        mock_dispatch_sms.side_effect = (
+            lambda to, message, purpose="OTP": create_sms_log(
+                to, TEST_SMS_FROM_NUMBER, message, purpose, "Sent", sid="SM_test"
+            )
         )
 
         phone = "+911234500001"
@@ -96,8 +98,10 @@ class IntegrationTestTPSMSOTP(IntegrationTestCase):
     def test_sms_otp_max_attempts(self, mock_generate_code, mock_dispatch_sms):
         from telephony.twilio.sms import create_sms_log, generate_otp, verify_otp
 
-        mock_dispatch_sms.side_effect = lambda to, message, purpose="OTP": create_sms_log(
-            to, TEST_SMS_FROM_NUMBER, message, purpose, "Sent", sid="SM_test"
+        mock_dispatch_sms.side_effect = (
+            lambda to, message, purpose="OTP": create_sms_log(
+                to, TEST_SMS_FROM_NUMBER, message, purpose, "Sent", sid="SM_test"
+            )
         )
 
         phone = "+911234500002"
@@ -109,15 +113,19 @@ class IntegrationTestTPSMSOTP(IntegrationTestCase):
             self.assertEqual(result["reason"], "incorrect_otp")
 
         locked_out = verify_otp(phone_number=phone, otp="654321", purpose="Login")
-        self.assertEqual(locked_out, {"verified": False, "reason": "max_attempts_exceeded"})
+        self.assertEqual(
+            locked_out, {"verified": False, "reason": "max_attempts_exceeded"}
+        )
 
     @patch("telephony.twilio.sms.dispatch_sms")
     @patch("telephony.twilio.sms.generate_otp_code", return_value="111222")
     def test_sms_otp_expiry(self, mock_generate_code, mock_dispatch_sms):
         from telephony.twilio.sms import create_sms_log, generate_otp, verify_otp
 
-        mock_dispatch_sms.side_effect = lambda to, message, purpose="OTP": create_sms_log(
-            to, TEST_SMS_FROM_NUMBER, message, purpose, "Sent", sid="SM_test"
+        mock_dispatch_sms.side_effect = (
+            lambda to, message, purpose="OTP": create_sms_log(
+                to, TEST_SMS_FROM_NUMBER, message, purpose, "Sent", sid="SM_test"
+            )
         )
 
         phone = "+911234500003"

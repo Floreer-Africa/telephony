@@ -9,7 +9,9 @@ def generate_otp_code(length: int) -> str:
     return "".join(secrets.choice(string.digits) for _ in range(length))
 
 
-def create_otp_record(recipient, channel, purpose, otp, expiry_seconds, notification_log=None):
+def create_otp_record(
+    recipient, channel, purpose, otp, expiry_seconds, notification_log=None
+):
     from passlib.hash import pbkdf2_sha256
 
     doc = frappe.get_doc(

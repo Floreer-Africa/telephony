@@ -27,7 +27,10 @@ def generate_otp(email: str, purpose: str = "Verification"):
     otp = generate_otp_code(settings.otp_length or 6)
     expiry_seconds = settings.otp_expiry_in_seconds or 300
 
-    template = settings.otp_message_template or "Your OTP is {otp}. It is valid for {expiry_minutes} minutes."
+    template = (
+        settings.otp_message_template
+        or "Your OTP is {otp}. It is valid for {expiry_minutes} minutes."
+    )
     message = template.format(otp=otp, expiry_minutes=max(1, expiry_seconds // 60))
     subject = settings.email_otp_subject or "Your verification code"
 
@@ -46,4 +49,6 @@ def verify_otp(email: str, otp: str, purpose: str = "Verification"):
     """Verify an OTP previously sent to the given email address."""
     settings = get_email_otp_settings()
     email = validate_email_address(email, throw=True)
-    return verify_otp_record(email, "Email", otp, purpose, settings.otp_max_attempts or 5)
+    return verify_otp_record(
+        email, "Email", otp, purpose, settings.otp_max_attempts or 5
+    )

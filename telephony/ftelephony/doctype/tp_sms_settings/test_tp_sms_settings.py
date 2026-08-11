@@ -15,12 +15,16 @@ class IntegrationTestTPSMSSettings(IntegrationTestCase):
 
     def setUp(self):
         super().setUp()
-        self._original_twilio_enabled = frappe.db.get_single_value("TP Twilio Settings", "enabled")
+        self._original_twilio_enabled = frappe.db.get_single_value(
+            "TP Twilio Settings", "enabled"
+        )
         self._original_sms_settings = frappe.get_doc("TP SMS Settings").as_dict()
         self.addCleanup(self._restore_settings)
 
     def _restore_settings(self):
-        frappe.db.set_single_value("TP Twilio Settings", "enabled", self._original_twilio_enabled)
+        frappe.db.set_single_value(
+            "TP Twilio Settings", "enabled", self._original_twilio_enabled
+        )
         original = self._original_sms_settings
         frappe.db.set_single_value(
             "TP SMS Settings",
@@ -83,6 +87,10 @@ class IntegrationTestTPSMSSettings(IntegrationTestCase):
         doc = frappe.get_doc("TP SMS Settings")
         doc.enabled = 0
         doc.enable_email_otp = 1
-        doc.save(ignore_permissions=True)  # should not throw, Email OTP has no Twilio dependency
+        doc.save(
+            ignore_permissions=True
+        )  # should not throw, Email OTP has no Twilio dependency
 
-        self.assertEqual(frappe.db.get_single_value("TP SMS Settings", "enable_email_otp"), 1)
+        self.assertEqual(
+            frappe.db.get_single_value("TP SMS Settings", "enable_email_otp"), 1
+        )

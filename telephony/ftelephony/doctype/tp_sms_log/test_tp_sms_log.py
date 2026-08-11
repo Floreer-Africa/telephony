@@ -22,7 +22,9 @@ class IntegrationTestTPSMSLog(IntegrationTestCase):
         )
         doc.insert(ignore_permissions=True)
         self.addCleanup(
-            lambda: frappe.delete_doc("TP SMS Log", doc.name, force=True, ignore_permissions=True)
+            lambda: frappe.delete_doc(
+                "TP SMS Log", doc.name, force=True, ignore_permissions=True
+            )
         )
 
         reloaded = frappe.get_doc("TP SMS Log", doc.name)
@@ -43,7 +45,9 @@ class IntegrationTestTPSMSLog(IntegrationTestCase):
         )
         doc.insert(ignore_permissions=True)
         self.addCleanup(
-            lambda: frappe.delete_doc("TP SMS Log", doc.name, force=True, ignore_permissions=True)
+            lambda: frappe.delete_doc(
+                "TP SMS Log", doc.name, force=True, ignore_permissions=True
+            )
         )
 
         reloaded = frappe.get_doc("TP SMS Log", doc.name)
