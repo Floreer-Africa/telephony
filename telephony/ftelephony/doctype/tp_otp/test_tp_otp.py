@@ -503,6 +503,21 @@ class IntegrationTestTPOTP(IntegrationTestCase):
             frappe.clear_cache(doctype="TP OTP Settings")
             self.assertGreater(get_send_sms_limit(), 1000)
 
+    def test_send_sms_limit_does_not_fail_open_when_unconfigured(self):
+        """A Single holds no value for a field until first save, so an existing
+        site reads None here. That must not be read as "unlimited" — only an
+        explicit 0 opts out."""
+        from telephony.twilio.sms import DEFAULT_SEND_SMS_LIMIT, get_send_sms_limit
+
+        with patch("frappe.get_cached_value", return_value=None):
+            self.assertEqual(get_send_sms_limit(), DEFAULT_SEND_SMS_LIMIT)
+
+        with patch("frappe.get_cached_value", return_value=0):
+            self.assertGreater(get_send_sms_limit(), 1000)
+
+        with patch("frappe.get_cached_value", return_value=25):
+            self.assertEqual(get_send_sms_limit(), 25)
+
     def test_verify_pays_the_kdf_cost_on_every_failure_path(self):
         """The failure body is uniform; the latency has to be too, or a guest
         can time-probe which recipients have a live OTP."""

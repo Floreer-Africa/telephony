@@ -24,8 +24,11 @@ SEND_SAVEPOINT = "tp_dispatch_sms"
 
 ASCII_DIGITS = frozenset("0123456789")
 
-# Stand-in for "no cap" when send_sms_rate_limit_per_hour is 0.
+# Stand-in for "no cap" when send_sms_rate_limit_per_hour is explicitly 0.
 UNLIMITED_SENDS = 10**9
+
+# Mirrors the field default, for sites whose settings have never been saved.
+DEFAULT_SEND_SMS_LIMIT = 60
 
 
 def clean_phone_number(phone_number: str) -> str:
@@ -125,8 +128,16 @@ def get_send_sms_limit():
     limit = frappe.get_cached_value(
         "TP OTP Settings", "TP OTP Settings", "send_sms_rate_limit_per_hour"
     )
-    # 0 disables the cap; the limiter has no "unlimited", so use a ceiling no
-    # single client will reach in one window.
+
+    # None is not 0. A Single holds no value for a field until the doc is first
+    # saved, so on an existing site this reads None until someone opens the
+    # form — treating that as "unlimited" would silently leave every such site
+    # uncapped. Only an explicit 0 opts out.
+    if limit is None:
+        return DEFAULT_SEND_SMS_LIMIT
+
+    # The limiter has no "unlimited", so use a ceiling no single client will
+    # reach within one window.
     return limit or UNLIMITED_SENDS
 
 
