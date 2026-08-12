@@ -1,13 +1,15 @@
 import frappe
 from frappe import _
+from frappe.deferred_insert import deferred_insert
 from frappe.rate_limiter import rate_limit
-from frappe.utils import now_datetime
+from frappe.utils import now
 
 from telephony.otp import (
+    RATE_LIMIT_FIELD,
     clean_purpose,
     create_otp_record,
     generate_otp_code,
-    normalize_form_field,
+    rate_limit_bucket,
     verify_otp_record,
 )
 
@@ -18,11 +20,11 @@ from .twilio_handler import Twilio
 # routing metadata (to/from/sid/status) and drop the body.
 REDACTED_MESSAGE = "[redacted]"
 
-# Named savepoint for the send attempt, so the failure path can discard its own
-# partial work without touching writes the caller made before calling in.
-SEND_SAVEPOINT = "tp_dispatch_sms"
-
 ASCII_DIGITS = frozenset("0123456789")
+
+# Punctuation people actually type into phone numbers. Anything outside this and
+# ASCII_DIGITS makes the input a rejection rather than something to clean up.
+PHONE_SEPARATORS = frozenset(" -().")
 
 # Stand-in for "no cap" when send_sms_rate_limit_per_hour is explicitly 0.
 UNLIMITED_SENDS = 10**9
@@ -41,19 +43,32 @@ def clean_phone_number(phone_number: str) -> str:
     quotas. Digits are extracted and a single ``+`` is re-attached, so all of
     ``+91 79-7739 6938``, ``917977396938`` and ``+917977396938`` agree.
 
-    Deliberately not ``str.isdigit()``: that is true for non-ASCII digits
-    (fullwidth ``０-９``, Arabic-Indic ``٠-٩``, …), which would survive as a
-    distinct Python string while MariaDB's default ``utf8mb4_unicode_ci``
-    collation compares them equal to their ASCII form — letting a caller land
-    on another recipient's row while holding a rate-limit bucket of their own.
+    Anything that is not a digit or ordinary phone punctuation is a *rejection*,
+    not something to strip. Discarding unexpected characters silently turns one
+    number into a different, deliverable one: ``"1. +919876543210"`` used to
+    yield ``+1919876543210``, a live US number, so the OTP went to a stranger.
+    Non-ASCII digits are rejected for the same reason and one more — they are
+    true under ``str.isdigit()``, and MariaDB's default ``utf8mb4_unicode_ci``
+    collation compares them equal to their ASCII form, so keeping them would let
+    a caller land on another recipient's row while holding a bucket of their own.
+
+    Leading ``+`` signs are the one thing dropped rather than rejected, so a
+    doubled ``++91…`` typo still resolves instead of failing a verification the
+    user has no way to diagnose.
 
     No country code is inferred: telephony is a library and the caller's
     dialling context is unknown, so a national-format number stays national
     and Twilio rejects it, exactly as before.
     """
-    digits = "".join(c for c in (phone_number or "") if c in ASCII_DIGITS)
+    digits = []
+    for char in (phone_number or "").strip().lstrip("+"):
+        if char in ASCII_DIGITS:
+            digits.append(char)
+        elif char not in PHONE_SEPARATORS:
+            return ""
+
     # "" rather than a bare "+", so the emptiness checks downstream still fire.
-    return f"+{digits}" if digits else ""
+    return f"+{''.join(digits)}" if digits else ""
 
 
 def get_sms_settings():
@@ -63,20 +78,33 @@ def get_sms_settings():
     return settings
 
 
+def build_sms_log(to, from_number, message, purpose, status, sid=None, error=None):
+    """Build the TP SMS Log payload, with the body redacted for OTP traffic.
+
+    Shared by both dispatch paths so the redaction cannot drift between them:
+    the failure path routes its row through Redis, and the rendered code must
+    not be sitting in a queue payload either.
+
+    ``sent_at`` is a string, not a datetime — this dict has to survive
+    ``json.dumps`` on the deferred path.
+    """
+    return {
+        "doctype": "TP SMS Log",
+        "to": to,
+        "from": from_number,
+        "message": REDACTED_MESSAGE if purpose == "OTP" else message,
+        "purpose": purpose,
+        "status": status,
+        "sid": sid,
+        "error": error,
+        "sent_by": frappe.session.user if frappe.session.user != "Guest" else None,
+        "sent_at": now(),
+    }
+
+
 def create_sms_log(to, from_number, message, purpose, status, sid=None, error=None):
     log = frappe.get_doc(
-        {
-            "doctype": "TP SMS Log",
-            "to": to,
-            "from": from_number,
-            "message": REDACTED_MESSAGE if purpose == "OTP" else message,
-            "purpose": purpose,
-            "status": status,
-            "sid": sid,
-            "error": error,
-            "sent_by": frappe.session.user if frappe.session.user != "Guest" else None,
-            "sent_at": now_datetime(),
-        }
+        build_sms_log(to, from_number, message, purpose, status, sid=sid, error=error)
     )
     log.insert(ignore_permissions=True)
     return log
@@ -85,43 +113,56 @@ def create_sms_log(to, from_number, message, purpose, status, sid=None, error=No
 def dispatch_sms(to, message, purpose="General"):
     """Send an SMS via Twilio and log the result."""
     settings = get_sms_settings()
-    # NOTE: Twilio.connect() re-reads TP Twilio Settings uncached and decrypts
-    # api_secret on every call — one extra query plus a KDF per SMS.
+
+    to = clean_phone_number(to)
+    # `to` and `message` are both mandatory on TP SMS Log, so an empty one would
+    # make the failure path's *own* audit write fail — losing the Failed row and
+    # masking the real error behind a MandatoryError. Reject up front, where
+    # there is still a caller to tell and no credential has been decrypted yet.
+    if not to:
+        frappe.throw(_("Please provide a valid phone number."))
+    if not message:
+        frappe.throw(_("Cannot send an empty SMS."))
+
+    # NOTE: connect() reads TP Twilio Settings from cache, but Twilio.__init__
+    # still decrypts api_secret and get_twilio_client() re-fetches the Single
+    # uncached to decrypt auth_token — two KDF rounds plus a query per SMS.
     twilio = Twilio.connect()
     if not twilio:
         frappe.throw(_("Please enable and configure TP Twilio Settings to send SMS."))
 
-    to = clean_phone_number(to)
     from_number = settings.sms_from_number
-
-    # Scoped to a savepoint so the failure path below can discard its own
-    # partial work without rolling back whatever the caller had already done.
-    frappe.db.savepoint(SEND_SAVEPOINT)
 
     try:
         message_obj = twilio.twilio_client.messages.create(
             to=to, from_=from_number, body=message
         )
     except Exception as e:
-        # The Failed row is the audit trail for this attempt, and it has to
-        # outlive the exception below — so commit it deliberately, after
-        # undoing anything this function itself wrote.
-        frappe.db.rollback(save_point=SEND_SAVEPOINT)
-        create_sms_log(to, from_number, message, purpose, "Failed", error=str(e))
+        # Deferred through Redis, not committed. The Failed row is this attempt's
+        # audit trail and has to outlive the frappe.throw below, but a
+        # frappe.db.commit() here would also commit whatever the *caller* had
+        # pending: called from a doc hook, an unrelated Twilio outage would
+        # persist that hook's half-finished writes while the request aborted.
+        # deferred_insert parks the row in Redis and the scheduler inserts it in
+        # a transaction of its own, so neither side can drag the other along.
+        deferred_insert(
+            "TP SMS Log",
+            [build_sms_log(to, from_number, message, purpose, "Failed", error=str(e))],
+        )
         # Pass an explicit message: with none, log_error falls back to
         # get_traceback(with_context=True), which renders every frame's locals
-        # into Error Log — including `message`, the rendered OTP body. That
-        # would leak in cleartext exactly what create_sms_log just redacted.
+        # into Error Log — including `message`, the rendered OTP body, and the
+        # decrypted api_secret held by twilio's own client frames. That would
+        # leak in cleartext exactly what is redacted and encrypted elsewhere.
+        # Deferred for the same reason as the row above.
         frappe.log_error(
             title="Failed to send SMS via Twilio",
             message=f"to={to} error={type(e).__name__}: {e}",
+            defer_insert=True,
         )
-        frappe.db.commit()  # nosemgrep: deliberate, see comment above
         # The raw Twilio error carries account SIDs, the configured from-number
         # and endpoint URLs; generate_otp is guest-callable, so keep it out.
         frappe.throw(_("Could not send the SMS. Please try again later."))
-
-    frappe.db.release_savepoint(SEND_SAVEPOINT)
 
     return create_sms_log(
         to, from_number, message, purpose, "Sent", sid=message_obj.sid
@@ -168,9 +209,13 @@ def send_sms(to: str, message: str):
     return {"name": log.name, "status": log.status}
 
 
+# ip_based=False: the default mixes the client IP into the identity, making this
+# a per-(IP, recipient) cap rather than the per-recipient one it is documented
+# as. Rotating IPs would then buy unlimited SMS to a single number, and the
+# Twilio bill with it.
 @frappe.whitelist(allow_guest=True, methods=["POST"])  # nosemgrep
-@normalize_form_field("phone_number", clean_phone_number)
-@rate_limit(key="phone_number", limit=5, seconds=10 * 60)
+@rate_limit_bucket("phone_number", clean_phone_number, "sms:generate")
+@rate_limit(key=RATE_LIMIT_FIELD, limit=5, seconds=10 * 60, ip_based=False)
 def generate_otp(phone_number: str, purpose: str = "Verification"):
     """Generate an OTP and send it over SMS to the given phone number."""
     settings = get_sms_settings()
@@ -187,10 +232,16 @@ def generate_otp(phone_number: str, purpose: str = "Verification"):
     )
 
     # Record first, so a user can never hold a code with no record to verify
-    # against. Note the failure path in dispatch_sms commits its Failed audit
-    # row, which persists this record too; it is unusable and expires on its
-    # own, which is the safer direction to fail in.
-    otp_doc = create_otp_record(phone_number, "SMS", purpose, otp, expiry_seconds)
+    # against. The failure path in dispatch_sms no longer commits, so a send
+    # failure rolls this record back with the rest of the request.
+    otp_doc = create_otp_record(
+        phone_number,
+        "SMS",
+        purpose,
+        otp,
+        expiry_seconds,
+        settings.otp_max_attempts,
+    )
     log = dispatch_sms(phone_number, message, purpose="OTP")
     otp_doc.db_set("notification_log", log.name, update_modified=False)
 
@@ -198,8 +249,8 @@ def generate_otp(phone_number: str, purpose: str = "Verification"):
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])  # nosemgrep
-@normalize_form_field("phone_number", clean_phone_number)
-@rate_limit(key="phone_number", limit=10, seconds=10 * 60)
+@rate_limit_bucket("phone_number", clean_phone_number, "sms:verify")
+@rate_limit(key=RATE_LIMIT_FIELD, limit=10, seconds=10 * 60, ip_based=False)
 def verify_otp(phone_number: str, otp: str, purpose: str = "Verification"):
     """Verify an OTP previously sent to the given phone number."""
     settings = get_sms_settings()

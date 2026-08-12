@@ -185,11 +185,11 @@ class IntegrationTestTPOTP(IntegrationTestCase):
             GENERIC_FAILURE,
         )
 
-        generate_otp(phone_number=PHONE_BUDGET, purpose="Login")
-        self.assertEqual(
-            verify_otp(phone_number=PHONE_BUDGET, otp="222333", purpose="Login"),
-            GENERIC_FAILURE,
-        )
+        # Resending is refused outright rather than issuing a code that starts
+        # at the cap: no SMS is paid for, and no new row is created to carry a
+        # refreshed expires_at.
+        with self.assertRaises(frappe.ValidationError):
+            generate_otp(phone_number=PHONE_BUDGET, purpose="Login")
 
         carried = frappe.db.get_value(
             "TP OTP",
@@ -198,6 +198,60 @@ class IntegrationTestTPOTP(IntegrationTestCase):
             order_by="creation desc",
         )
         self.assertEqual(carried, 2)
+        # the refused resend must not have added a row
+        self.assertEqual(
+            frappe.db.count("TP OTP", {"recipient": PHONE_BUDGET, "is_verified": 0}), 1
+        )
+
+    @patch("telephony.twilio.sms.dispatch_sms")
+    @patch("telephony.twilio.sms.generate_otp_code", return_value="222333")
+    def test_resending_while_locked_out_does_not_extend_the_lockout(
+        self, mock_generate_code, mock_dispatch_sms
+    ):
+        """Carrying attempts forward onto a row with a *fresh* expires_at made
+        the lockout self-perpetuating: every resend inside the window pushed the
+        expiry a full window further out while billing for a dead code, so a user
+        who reacted by retrying — the normal reaction — never got back in."""
+        from telephony.twilio.sms import generate_otp, verify_otp
+
+        mock_dispatch_sms.side_effect = self._log_sent_sms
+
+        generate_otp(phone_number=PHONE_BUDGET, purpose="Login")
+        for _ in range(2):
+            verify_otp(phone_number=PHONE_BUDGET, otp="000000", purpose="Login")
+
+        original_expiry = frappe.db.get_value(
+            "TP OTP",
+            {"recipient": PHONE_BUDGET, "is_verified": 0},
+            "expires_at",
+            order_by="creation desc",
+        )
+
+        # keep retrying across the window, as a locked-out user would
+        for offset in (60, 120, 240):
+            with self.freeze_time(add_to_date(now_datetime(), seconds=offset)):
+                with self.assertRaises(frappe.ValidationError):
+                    generate_otp(phone_number=PHONE_BUDGET, purpose="Login")
+
+        self.assertEqual(
+            frappe.db.get_value(
+                "TP OTP",
+                {"recipient": PHONE_BUDGET, "is_verified": 0},
+                "expires_at",
+                order_by="creation desc",
+            ),
+            original_expiry,
+        )
+        # no SMS was paid for by any of the refused resends
+        self.assertEqual(mock_dispatch_sms.call_count, 1)
+
+        # and the lockout drains on schedule despite the retries
+        with self.freeze_time(add_to_date(now_datetime(), seconds=301)):
+            generate_otp(phone_number=PHONE_BUDGET, purpose="Login")
+            self.assertEqual(
+                verify_otp(phone_number=PHONE_BUDGET, otp="222333", purpose="Login"),
+                {"verified": True},
+            )
 
     @patch("telephony.twilio.sms.dispatch_sms")
     @patch("telephony.twilio.sms.generate_otp_code", return_value="333444")
@@ -270,16 +324,79 @@ class IntegrationTestTPOTP(IntegrationTestCase):
     def test_rate_limit_key_is_normalized(self, mock_generate_code, mock_dispatch_sms):
         """frappe.rate_limit buckets on form_dict[key] verbatim, so the key has
         to be canonical or the send cap is bypassable by reformatting."""
+        from telephony.otp import RATE_LIMIT_FIELD
         from telephony.twilio.sms import generate_otp
 
         mock_dispatch_sms.side_effect = self._log_sent_sms
 
         self.addCleanup(frappe.form_dict.pop, "phone_number", None)
+        self.addCleanup(frappe.form_dict.pop, RATE_LIMIT_FIELD, None)
         frappe.form_dict["phone_number"] = "+91 12345-00006"
 
         generate_otp(phone_number="+91 12345-00006", purpose="Verification")
 
         self.assertEqual(frappe.form_dict["phone_number"], PHONE_NORMALIZE)
+        self.assertEqual(
+            frappe.form_dict[RATE_LIMIT_FIELD], f"sms:generate:{PHONE_NORMALIZE}"
+        )
+
+    def test_unusable_recipients_share_one_bucket(self):
+        """A recipient that cannot be canonicalized must not become its own
+        bucket: with the raw string as the key, varying the garbage minted fresh
+        quota against the address it would ultimately resolve to. They also must
+        not leave the key *empty*, which makes rate_limit throw its own "Either
+        key or IP flag is required" in place of the endpoint's message."""
+        from telephony.email_otp import clean_email
+        from telephony.otp import INVALID_RECIPIENT, RATE_LIMIT_FIELD, rate_limit_bucket
+
+        self.addCleanup(frappe.form_dict.pop, "email", None)
+        self.addCleanup(frappe.form_dict.pop, RATE_LIMIT_FIELD, None)
+
+        @rate_limit_bucket("email", clean_email, "email:generate")
+        def endpoint(email=None):
+            return frappe.form_dict[RATE_LIMIT_FIELD]
+
+        buckets = set()
+        for spelling in (
+            f"{TEST_EMAIL},,",
+            f"{TEST_EMAIL},,,",
+            f"{TEST_EMAIL} other@example.com",
+            "",
+        ):
+            frappe.form_dict["email"] = spelling
+            buckets.add(endpoint(email=spelling))
+
+        self.assertEqual(buckets, {f"email:generate:{INVALID_RECIPIENT}"})
+
+    @patch("telephony.email_otp.dispatch_email_otp")
+    def test_email_bucket_agrees_with_the_recipient_that_would_be_stored(
+        self, mock_dispatch_email
+    ):
+        """clean_email used to fall back to the raw string when parseaddr bailed,
+        while validate_email_address's per-piece fallback still resolved it — so
+        "victim@x.com,," bucketed separately but delivered to victim@x.com, and
+        each extra comma bought another untouched 5-per-10-minutes."""
+        from telephony.email_otp import clean_email
+        from telephony.email_otp import generate_otp as generate_email_otp
+
+        for spoofed in (f"{TEST_EMAIL},,", f"{TEST_EMAIL},,,,"):
+            self.assertEqual(clean_email(spoofed), "")
+            with self.assertRaises(frappe.ValidationError):
+                generate_email_otp(email=spoofed, purpose="Verification")
+
+        mock_dispatch_email.assert_not_called()
+
+        # The invariant, stated directly: for anything that *is* accepted, the
+        # bucket clean_email produces has to be the recipient that gets stored.
+        # parseaddr resolves more than it rejects — "a@x.com," loses the comma,
+        # "a@x.com x" becomes "a@x.comx" — and that is fine as long as the two
+        # sides agree, which is what this checks.
+        from telephony.email_otp import validate_single_email
+
+        for accepted in (TEST_EMAIL, f"{TEST_EMAIL},", f" {TEST_EMAIL.upper()} "):
+            stored = validate_single_email(accepted)
+            self.assertEqual(clean_email(accepted), stored, accepted)
+            self.assertEqual(clean_email(stored), stored, accepted)
 
     @patch("telephony.email_otp.dispatch_email_otp")
     @patch("telephony.email_otp.generate_otp_code", return_value="999888")
@@ -377,13 +494,29 @@ class IntegrationTestTPOTP(IntegrationTestCase):
     def test_clean_phone_number_rejects_non_ascii_digits(self):
         """str.isdigit() is true for fullwidth/Arabic-Indic digits, which
         MariaDB's utf8mb4_unicode_ci then compares equal to their ASCII form —
-        so they must not survive normalization."""
+        so they must not survive normalization. Rejected, not dropped: dropping
+        them would leave a shorter number that is still deliverable."""
         from telephony.twilio.sms import clean_phone_number
 
         # fullwidth ９１ and Arabic-Indic ٩١ both pass str.isdigit()
-        self.assertEqual(clean_phone_number("+９１1234500001"), "+1234500001")
-        self.assertEqual(clean_phone_number("+٩١1234500001"), "+1234500001")
+        self.assertEqual(clean_phone_number("+９１1234500001"), "")
+        self.assertEqual(clean_phone_number("+٩١1234500001"), "")
         self.assertEqual(clean_phone_number("+91 12345-00001"), "+911234500001")
+
+    def test_clean_phone_number_rejects_rather_than_absorbing_stray_input(self):
+        """Silently dropping unexpected characters rewrites one number into a
+        different, deliverable one — so the OTP reaches a stranger who never
+        asked for it. "1. +919876543210" used to yield +1919876543210."""
+        from telephony.twilio.sms import clean_phone_number
+
+        for rejected in (
+            "1. +919876543210",
+            "+91 7977 396938 ext 4",
+            "tel:+917977396938",
+            "+917977396938, +919876543210",
+            "<+917977396938>",
+        ):
+            self.assertEqual(clean_phone_number(rejected), "", rejected)
 
     def test_clean_phone_number_canonicalizes_to_one_e164_string(self):
         """Every spelling of one number must collapse to one string: it is both
@@ -442,7 +575,9 @@ class IntegrationTestTPOTP(IntegrationTestCase):
     @patch("telephony.twilio.sms.Twilio")
     def test_dispatch_sms_failure_is_generic_and_audited(self, MockTwilio):
         """The raised message must not carry Twilio internals, and the Failed
-        row must still be written."""
+        row must still be written — via Redis, not via a commit. A commit here
+        would also commit the *caller's* pending writes, so a Twilio outage
+        would persist a calling doc hook's half-finished work."""
         from telephony.twilio.sms import dispatch_sms
 
         client = MockTwilio.connect.return_value.twilio_client
@@ -450,24 +585,82 @@ class IntegrationTestTPOTP(IntegrationTestCase):
             "HTTP 401 error: ACfakeaccountsid https://api.twilio.com/2010-04-01"
         )
 
-        # The deliberate commit would otherwise break test isolation.
-        with patch("frappe.db.commit") as mock_commit:
+        with (
+            patch("frappe.db.commit") as mock_commit,
+            patch("telephony.twilio.sms.deferred_insert") as mock_deferred,
+        ):
             with self.assertRaises(frappe.ValidationError) as ctx:
                 dispatch_sms(PHONE_REDACT, "Your OTP is 123456.", purpose="OTP")
-            mock_commit.assert_called_once()
+            mock_commit.assert_not_called()
 
         raised = str(ctx.exception)
         self.assertNotIn("ACfakeaccountsid", raised)
         self.assertNotIn("api.twilio.com", raised)
 
-        failed = frappe.db.get_value(
-            "TP SMS Log",
-            {"to": PHONE_REDACT, "status": "Failed"},
-            ["message", "error"],
-            as_dict=True,
+        doctype, records = mock_deferred.call_args[0]
+        self.assertEqual(doctype, "TP SMS Log")
+        (failed,) = records
+        self.assertEqual(failed["status"], "Failed")
+        self.assertEqual(failed["to"], PHONE_REDACT)
+        # the queued payload must not carry the code either — it sits in Redis
+        self.assertEqual(failed["message"], REDACTED_MESSAGE)
+        self.assertNotIn("123456", str(failed))
+        self.assertIn("ACfakeaccountsid", failed["error"])
+
+    @patch("telephony.twilio.sms.Twilio")
+    def test_dispatch_sms_failure_payload_survives_json(self, MockTwilio):
+        """deferred_insert json.dumps() the record, so a datetime in it would
+        raise TypeError and lose the audit row outright."""
+        import json
+
+        from telephony.twilio.sms import build_sms_log
+
+        record = build_sms_log(
+            PHONE_REDACT, TEST_SMS_FROM_NUMBER, "body", "OTP", "Failed", error="boom"
         )
-        self.assertIsNotNone(failed)
-        self.assertEqual(failed.message, REDACTED_MESSAGE)
+        self.assertTrue(json.dumps([record]))
+
+    @patch("telephony.twilio.sms.Twilio")
+    def test_dispatch_sms_rejects_input_it_could_not_audit(self, MockTwilio):
+        """`to` and `message` are mandatory on TP SMS Log, so an empty one made
+        the failure path's own audit write raise MandatoryError — losing the
+        Failed row and masking the real error. Reject before sending instead."""
+        from telephony.twilio.sms import dispatch_sms
+
+        client = MockTwilio.connect.return_value.twilio_client
+
+        for to, message in (
+            ("not-a-number", "Your OTP is 123456."),
+            ("", "Your OTP is 123456."),
+            (PHONE_REDACT, ""),
+        ):
+            with self.assertRaises(frappe.ValidationError):
+                dispatch_sms(to, message, purpose="OTP")
+
+        client.messages.create.assert_not_called()
+        self.assertFalse(frappe.db.exists("TP SMS Log", {"to": ""}))
+
+    def _drive_rate_limiter(self, path, cmd=None):
+        """The limiter is inert without frappe.request, so give it one.
+
+        `cmd` is left unset by default because that is the /api/v2 shape: only
+        /api/v1 populates it, and rate_limit's cache key interpolates it.
+        """
+        from frappe.utils import set_request
+
+        from telephony.otp import RATE_LIMIT_FIELD
+
+        original_request = getattr(frappe.local, "request", None)
+        self.addCleanup(setattr, frappe.local, "request", original_request)
+        self.addCleanup(frappe.cache.delete_keys, "rl:")
+        self.addCleanup(frappe.form_dict.pop, "cmd", None)
+        self.addCleanup(frappe.form_dict.pop, "phone_number", None)
+        self.addCleanup(frappe.form_dict.pop, RATE_LIMIT_FIELD, None)
+
+        set_request(method="POST", path=path)
+        frappe.local.request_ip = "127.0.0.1"
+        if cmd:
+            frappe.form_dict.cmd = cmd
 
     @patch("telephony.twilio.sms.dispatch_sms")
     @patch("telephony.twilio.sms.generate_otp_code", return_value="123456")
@@ -476,24 +669,72 @@ class IntegrationTestTPOTP(IntegrationTestCase):
     ):
         """The limiter is inert without frappe.request, so the other tests never
         exercise it. Drive it with a request context and prove it fires."""
-        from frappe.utils import set_request
-
         from telephony.twilio.sms import generate_otp
 
         mock_dispatch_sms.side_effect = self._log_sent_sms
 
-        original_request = getattr(frappe.local, "request", None)
-        self.addCleanup(setattr, frappe.local, "request", original_request)
-        self.addCleanup(frappe.cache.delete_keys, "rl:")
-
-        set_request(method="POST", path="/api/method/telephony.twilio.sms.generate_otp")
-        frappe.local.request_ip = "127.0.0.1"
-        frappe.form_dict.cmd = "telephony.twilio.sms.generate_otp"
+        self._drive_rate_limiter("/api/method/telephony.twilio.sms.generate_otp")
         frappe.form_dict.phone_number = PHONE_NORMALIZE
-        self.addCleanup(frappe.form_dict.pop, "cmd", None)
-        self.addCleanup(frappe.form_dict.pop, "phone_number", None)
 
         # limit is 5 per 10 minutes
+        for _ in range(5):
+            generate_otp(phone_number=PHONE_NORMALIZE, purpose="Verification")
+
+        with self.assertRaises(frappe.RateLimitExceededError):
+            generate_otp(phone_number=PHONE_NORMALIZE, purpose="Verification")
+
+    @patch("telephony.twilio.sms.dispatch_sms")
+    @patch("telephony.twilio.sms.generate_otp_code", return_value="123456")
+    def test_otp_rate_limit_is_per_recipient_not_per_ip_and_recipient(
+        self, mock_generate_code, mock_dispatch_sms
+    ):
+        """rate_limit defaults to ip_based=True, which makes the identity
+        `ip:recipient` — so the cap documented as per-recipient was really
+        per-(IP, recipient), and rotating IPs bought unlimited SMS to one number
+        along with the Twilio bill for them."""
+        from telephony.twilio.sms import generate_otp
+
+        mock_dispatch_sms.side_effect = self._log_sent_sms
+
+        self._drive_rate_limiter("/api/method/telephony.twilio.sms.generate_otp")
+        frappe.form_dict.phone_number = PHONE_NORMALIZE
+
+        for i in range(5):
+            frappe.local.request_ip = f"10.0.0.{i}"
+            generate_otp(phone_number=PHONE_NORMALIZE, purpose="Verification")
+
+        # a sixth IP must not get a sixth send to the same number
+        frappe.local.request_ip = "10.0.0.99"
+        with self.assertRaises(frappe.RateLimitExceededError):
+            generate_otp(phone_number=PHONE_NORMALIZE, purpose="Verification")
+
+    @patch("telephony.twilio.sms.dispatch_sms")
+    @patch("telephony.twilio.sms.generate_otp_code", return_value="123456")
+    def test_generate_and_verify_do_not_share_a_rate_limit_counter(
+        self, mock_generate_code, mock_dispatch_sms
+    ):
+        """rate_limit's cache key is rl:{form_dict.cmd}:{identity}:{seconds} and
+        only /api/v1 sets cmd. Over /api/v2 it renders as None, so generate and
+        verify — same key, same identity, same 600s window — collided on one
+        counter and four failed verifies blocked the next resend."""
+        from telephony.twilio.sms import generate_otp, verify_otp
+
+        mock_dispatch_sms.side_effect = self._log_sent_sms
+
+        # cmd deliberately unset: this is the /api/v2 shape
+        self._drive_rate_limiter("/api/v2/method/telephony.twilio.sms.verify_otp")
+        frappe.form_dict.phone_number = PHONE_NORMALIZE
+
+        # burn most of verify's own budget (limit 10)
+        for _ in range(8):
+            self.assertEqual(
+                verify_otp(
+                    phone_number=PHONE_NORMALIZE, otp="000000", purpose="Verification"
+                ),
+                GENERIC_FAILURE,
+            )
+
+        # generate's budget (limit 5) must be untouched by them
         for _ in range(5):
             generate_otp(phone_number=PHONE_NORMALIZE, purpose="Verification")
 
@@ -571,7 +812,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
             self.assertEqual(mock_equalize.call_count, 1)
 
             # a live row, but the attempt budget is already spent
-            otp_module.create_otp_record(recipient, "SMS", "Login", "123456", 300)
+            otp_module.create_otp_record(recipient, "SMS", "Login", "123456", 300, 5)
             frappe.db.set_value(
                 "TP OTP",
                 {"recipient": recipient, "is_verified": 0},

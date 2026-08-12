@@ -6,10 +6,11 @@ from frappe.rate_limiter import rate_limit
 from frappe.utils import split_emails, validate_email_address
 
 from telephony.otp import (
+    RATE_LIMIT_FIELD,
     clean_purpose,
     create_otp_record,
     generate_otp_code,
-    normalize_form_field,
+    rate_limit_bucket,
     verify_otp_record,
 )
 
@@ -22,10 +23,17 @@ def clean_email(email: str) -> str:
     separators frappe treats as separators, and reduce ``Foo <a@x.com>`` to the
     bare address. This runs ahead of validation and on unvalidated input, so it
     never throws — rejection is ``validate_single_email``'s job.
+
+    Unparseable input yields ``""``, never the raw string. Falling back to the
+    raw string is what made the bucket disagree with the recipient that gets
+    stored: ``parseaddr`` bails to ``("", "")`` on malformed input, so
+    ``victim@x.com,,`` bucketed on ``"victim@x.com,,"`` while
+    ``validate_email_address``'s per-piece fallback still resolved it to
+    ``victim@x.com`` — and every extra comma minted another untouched 5-per-10
+    minutes against the same inbox.
     """
     email = (email or "").replace("\n", ",").replace("\r", ",").strip().lower()
-    parsed = parseaddr(email)[1]
-    return parsed or email
+    return parseaddr(email)[1]
 
 
 def validate_single_email(email: str) -> str:
@@ -73,9 +81,12 @@ def dispatch_email_otp(email, message, subject):
     )
 
 
+# ip_based=False: the default mixes the client IP into the identity, making this
+# a per-(IP, recipient) cap rather than the per-recipient one it is documented
+# as. Rotating IPs would then buy unlimited mail to a single inbox.
 @frappe.whitelist(allow_guest=True, methods=["POST"])  # nosemgrep
-@normalize_form_field("email", clean_email)
-@rate_limit(key="email", limit=5, seconds=10 * 60)
+@rate_limit_bucket("email", clean_email, "email:generate")
+@rate_limit(key=RATE_LIMIT_FIELD, limit=5, seconds=10 * 60, ip_based=False)
 def generate_otp(email: str, purpose: str = "Verification"):
     """Generate an OTP and send it over email to the given address."""
     settings = get_email_otp_settings()
@@ -92,15 +103,17 @@ def generate_otp(email: str, purpose: str = "Verification"):
 
     # Record first, mirroring the SMS flow: the mail is queued in this same
     # transaction, so a failure rolls both back together.
-    create_otp_record(email, "Email", purpose, otp, expiry_seconds)
+    create_otp_record(
+        email, "Email", purpose, otp, expiry_seconds, settings.otp_max_attempts
+    )
     dispatch_email_otp(email, message, subject)
 
     return {"sent": True, "expires_in": expiry_seconds}
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])  # nosemgrep
-@normalize_form_field("email", clean_email)
-@rate_limit(key="email", limit=10, seconds=10 * 60)
+@rate_limit_bucket("email", clean_email, "email:verify")
+@rate_limit(key=RATE_LIMIT_FIELD, limit=10, seconds=10 * 60, ip_based=False)
 def verify_otp(email: str, otp: str, purpose: str = "Verification"):
     """Verify an OTP previously sent to the given email address."""
     settings = get_email_otp_settings()

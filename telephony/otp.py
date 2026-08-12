@@ -16,6 +16,16 @@ MAX_PURPOSE_LENGTH = 140
 # what state it is in.
 GENERIC_FAILURE = {"verified": False, "reason": "invalid_or_expired"}
 
+# The form_dict field @rate_limit is pointed at. Always overwritten, never read
+# from the request, so a caller cannot nominate their own bucket.
+RATE_LIMIT_FIELD = "tp_rate_limit_key"
+
+# Bucket for any recipient that could not be canonicalized. Neither a valid
+# phone number nor a valid email address, so it can never collide with a real
+# recipient's quota; parking every unusable spelling in one shared bucket is
+# what stops a caller from minting fresh quota by varying the garbage.
+INVALID_RECIPIENT = "invalid"
+
 
 _DUMMY_HASH = None
 
@@ -58,13 +68,28 @@ def clean_purpose(purpose: str) -> str:
     return purpose
 
 
-def normalize_form_field(field, normalizer):
-    """Canonicalize ``field`` in ``form_dict`` before the rate limiter reads it.
+def rate_limit_bucket(field, normalizer, scope):
+    """Publish a canonical, endpoint-scoped rate-limit key into ``form_dict``.
 
-    ``frappe.rate_limit`` derives its bucket from ``frappe.form_dict[key]``
-    verbatim, so without this ``+911234500001``, ``+91 1234500001`` and
-    ``+91-1234500001`` are three separate buckets for one recipient — which
-    makes the send cap bypassable with a formatting loop.
+    ``@rate_limit`` cannot be pointed straight at the caller's field, for two
+    independent reasons:
+
+    1. It buckets on ``frappe.form_dict[key]`` verbatim, so ``+911234500001``,
+       ``+91 1234500001`` and ``+91-1234500001`` are three buckets for one
+       recipient — a formatting loop would walk straight past the send cap.
+    2. Its cache key is ``rl:{form_dict.cmd}:{identity}:{seconds}``, and only
+       ``/api/v1`` populates ``cmd``. Over ``/api/v2`` it renders as ``None``,
+       so two endpoints sharing a key field and a window collide on a single
+       counter — failed verifies would eat the resend quota and vice versa.
+
+    So normalize the value, qualify it with a per-endpoint ``scope``, and point
+    ``@rate_limit`` at the field written here instead of at the raw one.
+
+    ``normalizer`` runs on unvalidated input and must not throw. Anything it
+    cannot canonicalize lands in the shared ``INVALID_RECIPIENT`` bucket — the
+    endpoint's own validation rejects it a moment later, and the limiter still
+    has a non-empty key to work with (with ``ip_based=False`` an empty one makes
+    ``rate_limit`` throw its own "Either key or IP flag is required" instead).
 
     Must be applied *above* ``@rate_limit`` so it runs first.
     """
@@ -72,9 +97,14 @@ def normalize_form_field(field, normalizer):
     def decorator(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
-            raw = frappe.form_dict.get(field)
-            if raw:
-                frappe.form_dict[field] = normalizer(raw)
+            normalized = normalizer(frappe.form_dict.get(field))
+            # Only rewrite the caller's field if they actually sent it; the
+            # bucket is set unconditionally so the limiter is never keyless.
+            if field in frappe.form_dict:
+                frappe.form_dict[field] = normalized
+            frappe.form_dict[
+                RATE_LIMIT_FIELD
+            ] = f"{scope}:{normalized or INVALID_RECIPIENT}"
             return fn(*args, **kwargs)
 
         return wrapper
@@ -82,7 +112,7 @@ def normalize_form_field(field, normalizer):
     return decorator
 
 
-def consume_pending_otps(recipient, channel, purpose) -> int:
+def consume_pending_otps(recipient, channel, purpose, max_attempts) -> int:
     """Expire outstanding OTPs for this recipient and return attempts already
     spent against them.
 
@@ -91,6 +121,20 @@ def consume_pending_otps(recipient, channel, purpose) -> int:
     ``generate_otp`` call would hand out a fresh ``otp_max_attempts`` budget
     against the same short code space. Carrying forward only from *live* rows
     means the budget still resets naturally once the window lapses.
+
+    Once that carried budget is spent, refuse rather than issue another code.
+    The new row would start at the cap *and* carry a fresh ``expires_at``, so
+    each resend pushed the lockout a full window further out while billing for
+    a code that could never verify — a user who responds to being locked out by
+    retrying, which is the normal response, kept themselves locked out forever.
+    Refusing leaves the live row's expiry untouched, so the lockout drains on
+    its own no matter how often it is retried.
+
+    This does make "locked out" distinguishable from "not", unlike the uniform
+    GENERIC_FAILURE on the verify side. That is accepted: reaching this state
+    requires ``max_attempts`` failed verifies against a live OTP, which a caller
+    can only arrange for a recipient they are already able to target, so it
+    reveals nothing they could not have caused themselves.
     """
     pending = frappe.get_all(
         OTP_DOCTYPE,
@@ -106,6 +150,13 @@ def consume_pending_otps(recipient, channel, purpose) -> int:
     if not pending:
         return 0
 
+    spent_attempts = sum(row.attempts or 0 for row in pending)
+    if spent_attempts >= max_attempts:
+        frappe.throw(
+            _("Too many incorrect attempts. Please try again later."),
+            frappe.ValidationError,
+        )
+
     already_expired = add_to_date(now_datetime(), seconds=-1)
     for row in pending:
         # Expired rather than deleted — the row is an audit record.
@@ -113,15 +164,21 @@ def consume_pending_otps(recipient, channel, purpose) -> int:
             OTP_DOCTYPE, row.name, "expires_at", already_expired, update_modified=False
         )
 
-    return sum(row.attempts or 0 for row in pending)
+    return spent_attempts
 
 
 def create_otp_record(
-    recipient, channel, purpose, otp, expiry_seconds, notification_log=None
+    recipient,
+    channel,
+    purpose,
+    otp,
+    expiry_seconds,
+    max_attempts,
+    notification_log=None,
 ):
     from passlib.hash import pbkdf2_sha256
 
-    spent_attempts = consume_pending_otps(recipient, channel, purpose)
+    spent_attempts = consume_pending_otps(recipient, channel, purpose, max_attempts)
 
     doc = frappe.get_doc(
         {

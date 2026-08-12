@@ -82,15 +82,28 @@ class TPOTPSettings(Document):
     def validate_sms_from_number(self, twilio_settings):
         from telephony.twilio.twilio_handler import Twilio
 
-        twilio = Twilio(settings=twilio_settings)
         try:
+            # Constructing Twilio() is itself a live step: it decrypts
+            # api_secret and builds a TwilioClient, and both raise on a blank or
+            # malformed credential. Outside the try that traceback wedges the
+            # form — precisely the failure this handler exists to prevent.
+            twilio = Twilio(settings=twilio_settings)
             available_numbers = twilio.get_phone_numbers()
-        except Exception:
+        except Exception as e:
             # A live API call in validate() must not be able to wedge the doc.
             # Without this, a network or credential failure raises a raw
             # traceback and the form cannot be saved at all — not even to set
             # enabled = 0 and back out.
-            frappe.log_error(title=_("Could not list Twilio phone numbers"))
+            #
+            # Pass an explicit message: with none, log_error falls back to
+            # get_traceback(with_context=True), which renders every frame's
+            # locals into Error Log — and twilio's own client frames hold the
+            # decrypted api_secret, so the credential would be written out in
+            # cleartext next to the failure it caused.
+            frappe.log_error(
+                title="Could not list Twilio phone numbers",
+                message=f"{type(e).__name__}: {e}",
+            )
             frappe.throw(
                 _(
                     "Could not reach Twilio to confirm {0}. Check the Twilio"

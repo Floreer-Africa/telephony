@@ -97,6 +97,48 @@ class IntegrationTestTPOTPSettings(IntegrationTestCase):
             frappe.db.get_single_value("TP OTP Settings", "enable_email_otp"), 1
         )
 
+    def test_unreachable_twilio_gives_a_message_not_a_traceback(self):
+        """Constructing Twilio() is itself a live step — it decrypts api_secret
+        and builds a TwilioClient — so it has to be inside the try. Outside it, a
+        blank credential wedged the form with a raw traceback, which is exactly
+        the failure the handler was added to prevent."""
+        self._set_twilio_enabled(1)
+
+        with patch("telephony.twilio.twilio_handler.Twilio") as MockTwilio:
+            MockTwilio.side_effect = Exception("Credential is blank")
+
+            doc = frappe.get_doc("TP OTP Settings")
+            doc.enabled = 1
+            doc.sms_from_number = TEST_FROM_NUMBER
+            with self.assertRaises(frappe.ValidationError) as ctx:
+                doc.save(ignore_permissions=True)
+
+        self.assertIn("Could not reach Twilio", str(ctx.exception))
+
+    def test_twilio_failure_is_logged_without_a_traceback_of_locals(self):
+        """log_error with no message falls back to get_traceback(with_context=True),
+        which renders every frame's locals — and twilio's own client frames hold
+        the decrypted api_secret, so the credential lands in Error Log."""
+        self._set_twilio_enabled(1)
+
+        with (
+            patch("telephony.twilio.twilio_handler.Twilio") as MockTwilio,
+            patch("frappe.log_error") as mock_log_error,
+        ):
+            MockTwilio.return_value.get_phone_numbers.side_effect = Exception(
+                "HTTP 401 error: authenticate"
+            )
+
+            doc = frappe.get_doc("TP OTP Settings")
+            doc.enabled = 1
+            doc.sms_from_number = TEST_FROM_NUMBER
+            with self.assertRaises(frappe.ValidationError):
+                doc.save(ignore_permissions=True)
+
+        _, kwargs = mock_log_error.call_args
+        self.assertTrue(kwargs.get("message"))
+        self.assertIn("HTTP 401 error", kwargs["message"])
+
     def test_rejects_otp_length_below_minimum(self):
         """A 1-digit OTP is 10 combinations; no attempt cap makes that safe."""
         doc = frappe.get_doc("TP OTP Settings")
