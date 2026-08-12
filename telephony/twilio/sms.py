@@ -32,17 +32,28 @@ DEFAULT_SEND_SMS_LIMIT = 60
 
 
 def clean_phone_number(phone_number: str) -> str:
-    """Strip everything except ASCII digits and a leading `+`.
+    """Canonicalize to a single E.164-shaped string: ``+`` then ASCII digits.
+
+    Every spelling of one number has to collapse to one string, because this
+    value is both the ``TP OTP.recipient`` lookup key and the rate-limit
+    bucket. Keeping the caller's ``+`` verbatim was not enough: ``91…`` and
+    ``+91…`` stayed distinct, so one number still had two OTP rows and two
+    quotas. Digits are extracted and a single ``+`` is re-attached, so all of
+    ``+91 79-7739 6938``, ``917977396938`` and ``+917977396938`` agree.
 
     Deliberately not ``str.isdigit()``: that is true for non-ASCII digits
-    (fullwidth ``０-９``, Arabic-Indic ``٠-٩``, …), which would survive
-    normalization as a distinct Python string while MariaDB's default
-    ``utf8mb4_unicode_ci`` collation compares them equal to their ASCII form.
-    A caller could then land on another recipient's TP OTP row while holding a
-    rate-limit bucket of their own.
+    (fullwidth ``０-９``, Arabic-Indic ``٠-٩``, …), which would survive as a
+    distinct Python string while MariaDB's default ``utf8mb4_unicode_ci``
+    collation compares them equal to their ASCII form — letting a caller land
+    on another recipient's row while holding a rate-limit bucket of their own.
+
+    No country code is inferred: telephony is a library and the caller's
+    dialling context is unknown, so a national-format number stays national
+    and Twilio rejects it, exactly as before.
     """
-    phone_number = (phone_number or "").strip()
-    return "".join(c for c in phone_number if c in ASCII_DIGITS or c == "+")
+    digits = "".join(c for c in (phone_number or "") if c in ASCII_DIGITS)
+    # "" rather than a bare "+", so the emptiness checks downstream still fire.
+    return f"+{digits}" if digits else ""
 
 
 def get_sms_settings():

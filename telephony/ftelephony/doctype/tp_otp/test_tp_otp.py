@@ -385,6 +385,46 @@ class IntegrationTestTPOTP(IntegrationTestCase):
         self.assertEqual(clean_phone_number("+٩١1234500001"), "+1234500001")
         self.assertEqual(clean_phone_number("+91 12345-00001"), "+911234500001")
 
+    def test_clean_phone_number_canonicalizes_to_one_e164_string(self):
+        """Every spelling of one number must collapse to one string: it is both
+        the TP OTP lookup key and the rate-limit bucket, so `91...` and `+91...`
+        being distinct meant one number held two of each."""
+        from telephony.twilio.sms import clean_phone_number
+
+        canonical = "+917977396938"
+        for spelling in (
+            "+917977396938",
+            "917977396938",
+            "+91 7977 396938",
+            "+91-7977-396938",
+            "  +91 (7977) 396938  ",
+            "++917977396938",
+        ):
+            self.assertEqual(clean_phone_number(spelling), canonical, spelling)
+
+        # a bare "+" must come back empty so the "provide a valid phone number"
+        # checks still fire, rather than handing Twilio a "+"
+        for empty in ("", "   ", "+", "++", None):
+            self.assertEqual(clean_phone_number(empty), "")
+
+    @patch("telephony.twilio.sms.dispatch_sms")
+    @patch("telephony.twilio.sms.generate_otp_code", return_value="123456")
+    def test_otp_verifies_regardless_of_number_spelling(
+        self, mock_generate_code, mock_dispatch_sms
+    ):
+        """The live consequence of the above: a code requested with one
+        spelling has to verify with another."""
+        from telephony.twilio.sms import generate_otp, verify_otp
+
+        mock_dispatch_sms.side_effect = self._log_sent_sms
+
+        generate_otp(phone_number="+911234500004", purpose="Verification")
+
+        result = verify_otp(
+            phone_number="911234500004", otp="123456", purpose="Verification"
+        )
+        self.assertEqual(result, {"verified": True})
+
     @patch("telephony.twilio.sms.Twilio")
     def test_dispatch_sms_success_writes_redacted_sent_log(self, MockTwilio):
         """Exercises the real dispatch_sms, which every other test mocks out."""

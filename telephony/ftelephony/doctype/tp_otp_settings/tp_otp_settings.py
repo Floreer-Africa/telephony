@@ -4,6 +4,7 @@
 import frappe
 from frappe import _
 from frappe.model.document import Document
+from frappe.utils import cint
 
 # A 4-digit code is already only 10k combinations; anything shorter is not
 # worth rate-limiting around.
@@ -29,20 +30,27 @@ class TPOTPSettings(Document):
 
     def validate_otp_params(self):
         """Guard the OTP knobs, since weak values here silently weaken every
-        OTP the site issues."""
-        if self.otp_length < MIN_OTP_LENGTH:
+        OTP the site issues.
+
+        Read through ``cint``: a saved doc carries the field defaults, but a
+        NULL left by ``db.set_single_value`` or a patch would make a bare
+        ``None < 4`` raise TypeError and wedge the form with a traceback
+        instead of a message an admin can act on. cint maps None to 0, which
+        these bounds already reject.
+        """
+        if cint(self.otp_length) < MIN_OTP_LENGTH:
             frappe.throw(
                 _("OTP Length must be at least {0}.").format(MIN_OTP_LENGTH),
                 frappe.ValidationError,
             )
 
-        if self.otp_expiry_in_seconds < 1:
+        if cint(self.otp_expiry_in_seconds) < 1:
             frappe.throw(
                 _("OTP Expiry (in seconds) must be at least 1."),
                 frappe.ValidationError,
             )
 
-        if self.otp_max_attempts < 1:
+        if cint(self.otp_max_attempts) < 1:
             frappe.throw(
                 _("OTP Max Attempts must be at least 1."), frappe.ValidationError
             )

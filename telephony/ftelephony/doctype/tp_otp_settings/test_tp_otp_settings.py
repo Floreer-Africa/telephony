@@ -119,6 +119,16 @@ class IntegrationTestTPOTPSettings(IntegrationTestCase):
         with self.assertRaises(frappe.ValidationError):
             doc.save(ignore_permissions=True)
 
+    def test_null_otp_params_give_a_message_not_a_traceback(self):
+        """A NULL left by db.set_single_value or a patch must not make
+        `None < 4` raise TypeError and wedge the settings form."""
+        for field in ("otp_length", "otp_expiry_in_seconds", "otp_max_attempts"):
+            doc = frappe.get_doc("TP OTP Settings")
+            doc.enabled = 0
+            setattr(doc, field, None)
+            with self.assertRaises(frappe.ValidationError):
+                doc.save(ignore_permissions=True)
+
     def test_rejects_template_without_otp_placeholder(self):
         """Without {otp} the recipient would receive a message with no code."""
         doc = frappe.get_doc("TP OTP Settings")
