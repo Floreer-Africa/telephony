@@ -8,6 +8,9 @@ from frappe.tests import IntegrationTestCase
 from frappe.utils import add_to_date, now_datetime
 
 from telephony.ftelephony.doctype.tp_otp_settings.tp_otp_settings import TPOTPSettings
+from telephony.ftelephony.doctype.tp_twilio_settings.tp_twilio_settings import (
+    TPTwilioSettings,
+)
 from telephony.otp import GENERIC_FAILURE
 from telephony.twilio.sms import REDACTED_MESSAGE
 
@@ -54,12 +57,18 @@ class IntegrationTestTPOTP(IntegrationTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+        # TP Twilio Settings.validate() authenticates against the live Twilio
+        # API and on_update() provisions API keys there; neither is reachable
+        # from tests. Stub both so change_settings can drive the doc normally.
+        for method in ("validate_twilio_account", "on_update"):
+            twilio_patcher = patch.object(TPTwilioSettings, method, return_value=None)
+            twilio_patcher.start()
+            self.addCleanup(twilio_patcher.stop)
+
         # validate() also requires TP Twilio Settings to be enabled.
-        original_twilio_enabled = frappe.db.get_single_value(
-            "TP Twilio Settings", "enabled"
-        )
-        self.addCleanup(self._restore_twilio_enabled, original_twilio_enabled)
-        frappe.db.set_single_value("TP Twilio Settings", "enabled", 1)
+        twilio_settings = self.change_settings("TP Twilio Settings", {"enabled": 1})
+        twilio_settings.__enter__()
+        self.addCleanup(twilio_settings.__exit__, None, None, None)
         frappe.clear_cache(doctype="TP Twilio Settings")
 
         settings = self.change_settings(
@@ -78,10 +87,6 @@ class IntegrationTestTPOTP(IntegrationTestCase):
         frappe.clear_cache(doctype="TP OTP Settings")
 
         self.addCleanup(self._delete_test_records)
-
-    def _restore_twilio_enabled(self, enabled):
-        frappe.db.set_single_value("TP Twilio Settings", "enabled", enabled)
-        frappe.clear_cache(doctype="TP Twilio Settings")
 
     def _delete_test_records(self):
         frappe.db.delete("TP OTP", {"recipient": ["in", TEST_RECIPIENTS]})
@@ -423,6 +428,66 @@ class IntegrationTestTPOTP(IntegrationTestCase):
         )
         self.assertIsNotNone(failed)
         self.assertEqual(failed.message, REDACTED_MESSAGE)
+
+    @patch("telephony.twilio.sms.dispatch_sms")
+    @patch("telephony.twilio.sms.generate_otp_code", return_value="123456")
+    def test_rate_limit_actually_throttles_sends(
+        self, mock_generate_code, mock_dispatch_sms
+    ):
+        """The limiter is inert without frappe.request, so the other tests never
+        exercise it. Drive it with a request context and prove it fires."""
+        from frappe.utils import set_request
+
+        from telephony.twilio.sms import generate_otp
+
+        mock_dispatch_sms.side_effect = self._log_sent_sms
+
+        original_request = getattr(frappe.local, "request", None)
+        self.addCleanup(setattr, frappe.local, "request", original_request)
+        self.addCleanup(frappe.cache.delete_keys, "rl:")
+
+        set_request(method="POST", path="/api/method/telephony.twilio.sms.generate_otp")
+        frappe.local.request_ip = "127.0.0.1"
+        frappe.form_dict.cmd = "telephony.twilio.sms.generate_otp"
+        frappe.form_dict.phone_number = PHONE_NORMALIZE
+        self.addCleanup(frappe.form_dict.pop, "cmd", None)
+        self.addCleanup(frappe.form_dict.pop, "phone_number", None)
+
+        # limit is 5 per 10 minutes
+        for _ in range(5):
+            generate_otp(phone_number=PHONE_NORMALIZE, purpose="Verification")
+
+        with self.assertRaises(frappe.RateLimitExceededError):
+            generate_otp(phone_number=PHONE_NORMALIZE, purpose="Verification")
+
+    def test_guest_may_call_otp_endpoints_but_not_send_sms(self):
+        """Guest access is decided by frappe.is_whitelisted against the exact
+        object registered at decoration time. Since normalize_form_field wraps
+        the function *under* @frappe.whitelist, a mistake in that stacking would
+        silently drop guest registration — so assert it directly."""
+        from telephony import email_otp
+        from telephony.twilio import sms
+
+        guest_callable = [
+            sms.generate_otp,
+            sms.verify_otp,
+            email_otp.generate_otp,
+            email_otp.verify_otp,
+        ]
+
+        with self.set_user("Guest"):
+            for fn in guest_callable:
+                frappe.is_whitelisted(fn)  # must not raise
+
+            with self.assertRaises(frappe.PermissionError):
+                frappe.is_whitelisted(sms.send_sms)
+
+        # POST-only: GET skips Frappe's CSRF check, so a state-changing
+        # whitelisted method must not accept it.
+        for fn in [*guest_callable, sms.send_sms]:
+            self.assertEqual(
+                tuple(frappe.allowed_http_methods_for_whitelisted_func[fn]), ("POST",)
+            )
 
     def test_send_sms_requires_permission(self):
         from telephony.twilio.sms import send_sms
