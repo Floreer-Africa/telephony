@@ -336,6 +336,94 @@ class IntegrationTestTPOTP(IntegrationTestCase):
 
         mock_dispatch_email.assert_not_called()
 
+    @patch("telephony.email_otp.dispatch_email_otp")
+    def test_email_otp_rejects_newline_separated_addresses(self, mock_dispatch_email):
+        """A newline is the separator that slips past a split_emails() count:
+        split_emails collapses \\n to a space before splitting, while
+        validate_email_address turns it into a comma and returns both."""
+        from telephony.email_otp import generate_otp as generate_email_otp
+
+        for separator in ("\n", "\r"):
+            with self.assertRaises(frappe.ValidationError):
+                generate_email_otp(
+                    email=f"{TEST_EMAIL}{separator}other@example.com",
+                    purpose="Verification",
+                )
+
+        mock_dispatch_email.assert_not_called()
+
+    def test_email_otp_is_redacted_from_the_email_queue(self):
+        """Email Queue keeps the rendered body for 30 days, so the queued OTP
+        must not outlive its own expiry in cleartext."""
+        import inspect
+
+        from telephony.email_otp import dispatch_email_otp
+
+        with patch("frappe.sendmail") as mock_sendmail:
+            dispatch_email_otp(TEST_EMAIL, "Your OTP is 123456.", "Code")
+
+        _, kwargs = mock_sendmail.call_args
+        self.assertTrue(kwargs.get("redact_message_after_send"))
+        # guard against the kwarg being silently dropped by a frappe upgrade
+        self.assertIn(
+            "redact_message_after_send", inspect.signature(frappe.sendmail).parameters
+        )
+
+    def test_clean_phone_number_rejects_non_ascii_digits(self):
+        """str.isdigit() is true for fullwidth/Arabic-Indic digits, which
+        MariaDB's utf8mb4_unicode_ci then compares equal to their ASCII form —
+        so they must not survive normalization."""
+        from telephony.twilio.sms import clean_phone_number
+
+        # fullwidth ９１ and Arabic-Indic ٩١ both pass str.isdigit()
+        self.assertEqual(clean_phone_number("+９１1234500001"), "+1234500001")
+        self.assertEqual(clean_phone_number("+٩١1234500001"), "+1234500001")
+        self.assertEqual(clean_phone_number("+91 12345-00001"), "+911234500001")
+
+    @patch("telephony.twilio.sms.Twilio")
+    def test_dispatch_sms_success_writes_redacted_sent_log(self, MockTwilio):
+        """Exercises the real dispatch_sms, which every other test mocks out."""
+        from telephony.twilio.sms import dispatch_sms
+
+        client = MockTwilio.connect.return_value.twilio_client
+        client.messages.create.return_value = frappe._dict(sid="SM_ok")
+
+        log = dispatch_sms(PHONE_REDACT, "Your OTP is 123456.", purpose="OTP")
+
+        self.assertEqual(log.status, "Sent")
+        self.assertEqual(log.sid, "SM_ok")
+        self.assertEqual(log.message, REDACTED_MESSAGE)
+
+    @patch("telephony.twilio.sms.Twilio")
+    def test_dispatch_sms_failure_is_generic_and_audited(self, MockTwilio):
+        """The raised message must not carry Twilio internals, and the Failed
+        row must still be written."""
+        from telephony.twilio.sms import dispatch_sms
+
+        client = MockTwilio.connect.return_value.twilio_client
+        client.messages.create.side_effect = Exception(
+            "HTTP 401 error: ACfakeaccountsid https://api.twilio.com/2010-04-01"
+        )
+
+        # The deliberate commit would otherwise break test isolation.
+        with patch("frappe.db.commit") as mock_commit:
+            with self.assertRaises(frappe.ValidationError) as ctx:
+                dispatch_sms(PHONE_REDACT, "Your OTP is 123456.", purpose="OTP")
+            mock_commit.assert_called_once()
+
+        raised = str(ctx.exception)
+        self.assertNotIn("ACfakeaccountsid", raised)
+        self.assertNotIn("api.twilio.com", raised)
+
+        failed = frappe.db.get_value(
+            "TP SMS Log",
+            {"to": PHONE_REDACT, "status": "Failed"},
+            ["message", "error"],
+            as_dict=True,
+        )
+        self.assertIsNotNone(failed)
+        self.assertEqual(failed.message, REDACTED_MESSAGE)
+
     def test_send_sms_requires_permission(self):
         from telephony.twilio.sms import send_sms
 

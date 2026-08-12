@@ -131,7 +131,10 @@ def verify_otp_record(recipient, channel, otp, purpose, max_attempts):
     if not otp_name:
         return dict(GENERIC_FAILURE)
 
-    otp_doc = frappe.get_doc(OTP_DOCTYPE, otp_name)
+    # Locked: reading and incrementing `attempts` is a read-modify-write, so
+    # concurrent verifies would otherwise share a stale count and collectively
+    # exceed otp_max_attempts.
+    otp_doc = frappe.get_doc(OTP_DOCTYPE, otp_name, for_update=True)
 
     if get_datetime(otp_doc.expires_at) < now_datetime():
         return dict(GENERIC_FAILURE)

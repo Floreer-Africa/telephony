@@ -18,11 +18,25 @@ from .twilio_handler import Twilio
 # routing metadata (to/from/sid/status) and drop the body.
 REDACTED_MESSAGE = "[redacted]"
 
+# Named savepoint for the send attempt, so the failure path can discard its own
+# partial work without touching writes the caller made before calling in.
+SEND_SAVEPOINT = "tp_dispatch_sms"
+
+ASCII_DIGITS = frozenset("0123456789")
+
 
 def clean_phone_number(phone_number: str) -> str:
-    """Strip everything except digits and a leading `+`."""
+    """Strip everything except ASCII digits and a leading `+`.
+
+    Deliberately not ``str.isdigit()``: that is true for non-ASCII digits
+    (fullwidth ``０-９``, Arabic-Indic ``٠-٩``, …), which would survive
+    normalization as a distinct Python string while MariaDB's default
+    ``utf8mb4_unicode_ci`` collation compares them equal to their ASCII form.
+    A caller could then land on another recipient's TP OTP row while holding a
+    rate-limit bucket of their own.
+    """
     phone_number = (phone_number or "").strip()
-    return "".join(c for c in phone_number if c.isdigit() or c == "+")
+    return "".join(c for c in phone_number if c in ASCII_DIGITS or c == "+")
 
 
 def get_sms_settings():
@@ -63,22 +77,34 @@ def dispatch_sms(to, message, purpose="General"):
     to = clean_phone_number(to)
     from_number = settings.sms_from_number
 
+    # Scoped to a savepoint so the failure path below can discard its own
+    # partial work without rolling back whatever the caller had already done.
+    frappe.db.savepoint(SEND_SAVEPOINT)
+
     try:
         message_obj = twilio.twilio_client.messages.create(
             to=to, from_=from_number, body=message
         )
     except Exception as e:
-        # This request is about to be rolled back, but the failure log is the
-        # audit trail for the send attempt. Discard the partial work first so
-        # nothing half-written (e.g. an unusable OTP row) survives, then
-        # persist the log on its own.
-        frappe.db.rollback()
+        # The Failed row is the audit trail for this attempt, and it has to
+        # outlive the exception below — so commit it deliberately, after
+        # undoing anything this function itself wrote.
+        frappe.db.rollback(save_point=SEND_SAVEPOINT)
         create_sms_log(to, from_number, message, purpose, "Failed", error=str(e))
-        frappe.log_error(title=_("Failed to send SMS via Twilio"))
+        # Pass an explicit message: with none, log_error falls back to
+        # get_traceback(with_context=True), which renders every frame's locals
+        # into Error Log — including `message`, the rendered OTP body. That
+        # would leak in cleartext exactly what create_sms_log just redacted.
+        frappe.log_error(
+            title="Failed to send SMS via Twilio",
+            message=f"to={to} error={type(e).__name__}: {e}",
+        )
         frappe.db.commit()  # nosemgrep: deliberate, see comment above
         # The raw Twilio error carries account SIDs, the configured from-number
         # and endpoint URLs; generate_otp is guest-callable, so keep it out.
         frappe.throw(_("Could not send the SMS. Please try again later."))
+
+    frappe.db.release_savepoint(SEND_SAVEPOINT)
 
     return create_sms_log(
         to, from_number, message, purpose, "Sent", sid=message_obj.sid
@@ -113,8 +139,10 @@ def generate_otp(phone_number: str, purpose: str = "Verification"):
         otp=otp, expiry_minutes=max(1, expiry_seconds // 60)
     )
 
-    # Record first: if the send fails the whole request rolls back, so a user
-    # can never be left holding a code that has no record to verify against.
+    # Record first, so a user can never hold a code with no record to verify
+    # against. Note the failure path in dispatch_sms commits its Failed audit
+    # row, which persists this record too; it is unusable and expires on its
+    # own, which is the safer direction to fail in.
     otp_doc = create_otp_record(phone_number, "SMS", purpose, otp, expiry_seconds)
     log = dispatch_sms(phone_number, message, purpose="OTP")
     otp_doc.db_set("notification_log", log.name, update_modified=False)

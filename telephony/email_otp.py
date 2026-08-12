@@ -1,3 +1,5 @@
+from email.utils import parseaddr
+
 import frappe
 from frappe import _
 from frappe.rate_limiter import rate_limit
@@ -13,9 +15,17 @@ from telephony.otp import (
 
 
 def clean_email(email: str) -> str:
-    """Canonicalize for storage *and* for rate-limit bucketing, so that case
-    variants of one address cannot each claim their own quota."""
-    return (email or "").strip().lower()
+    """Canonicalize for rate-limit bucketing.
+
+    Must agree with what ``validate_single_email`` ultimately stores, or the
+    quota can be split across spellings of one address. So collapse the
+    separators frappe treats as separators, and reduce ``Foo <a@x.com>`` to the
+    bare address. This runs ahead of validation and on unvalidated input, so it
+    never throws — rejection is ``validate_single_email``'s job.
+    """
+    email = (email or "").replace("\n", ",").replace("\r", ",").strip().lower()
+    parsed = parseaddr(email)[1]
+    return parsed or email
 
 
 def validate_single_email(email: str) -> str:
@@ -25,15 +35,22 @@ def validate_single_email(email: str) -> str:
     returns the addresses re-joined, so ``"a@x.com, b@y.com"`` passes. That
     would land two addresses in a single ``TP OTP.recipient`` and produce a
     malformed ``To:`` header, since ``sendmail`` does not re-split a list item.
+
+    The count has to be taken from what ``validate_email_address`` *returns*,
+    not from ``split_emails`` of the input: ``split_emails`` collapses ``\\n``
+    to a space before splitting, while ``validate_email_address`` turns it into
+    a separator. Checking the input therefore lets ``"a@x.com\\nb@y.com"``
+    through as "one" address and yields two.
     """
     email = clean_email(email)
     if not email:
         frappe.throw(_("Please provide a valid email address."))
 
-    if len(split_emails(email)) > 1:
+    validated = validate_email_address(email, throw=True)
+    if len(split_emails(validated.replace("\n", ",").replace("\r", ","))) != 1:
         frappe.throw(_("Please provide a single email address."))
 
-    return validate_email_address(email, throw=True)
+    return validated
 
 
 def get_email_otp_settings():
@@ -44,7 +61,16 @@ def get_email_otp_settings():
 
 
 def dispatch_email_otp(email, message, subject):
-    frappe.sendmail(recipients=[email], subject=subject, message=message)
+    # redact_message_after_send: the queued body carries the cleartext code and
+    # Email Queue is retained for 30 days, so without this the OTP outlives its
+    # own expiry in a readable table — undoing the hashing in TP OTP, the same
+    # way an unredacted TP SMS Log would on the SMS side.
+    frappe.sendmail(
+        recipients=[email],
+        subject=subject,
+        message=message,
+        redact_message_after_send=True,
+    )
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])  # nosemgrep
