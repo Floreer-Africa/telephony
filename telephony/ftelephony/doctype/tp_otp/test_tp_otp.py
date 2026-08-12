@@ -460,6 +460,81 @@ class IntegrationTestTPOTP(IntegrationTestCase):
         with self.assertRaises(frappe.RateLimitExceededError):
             generate_otp(phone_number=PHONE_NORMALIZE, purpose="Verification")
 
+    @patch("telephony.twilio.sms.dispatch_sms")
+    def test_send_sms_is_rate_limited_and_configurable(self, mock_dispatch_sms):
+        """send_sms sends arbitrary content to arbitrary numbers at real cost,
+        so it needs a cap — but a hardcoded one would break bulk senders, hence
+        the setting."""
+        from frappe.utils import set_request
+
+        from telephony.twilio.sms import get_send_sms_limit, send_sms
+
+        mock_dispatch_sms.side_effect = (
+            lambda to, message, purpose="General": self._log_sent_sms(
+                to, message, purpose
+            )
+        )
+
+        original_request = getattr(frappe.local, "request", None)
+        self.addCleanup(setattr, frappe.local, "request", original_request)
+        self.addCleanup(frappe.cache.delete_keys, "rl:")
+
+        set_request(method="POST", path="/api/method/telephony.twilio.sms.send_sms")
+        frappe.local.request_ip = "127.0.0.1"
+        frappe.form_dict.cmd = "telephony.twilio.sms.send_sms"
+        self.addCleanup(frappe.form_dict.pop, "cmd", None)
+
+        with self.change_settings(
+            "TP OTP Settings", {"send_sms_rate_limit_per_hour": 2}
+        ):
+            frappe.clear_cache(doctype="TP OTP Settings")
+            self.assertEqual(get_send_sms_limit(), 2)
+
+            for _ in range(2):
+                send_sms(to=PHONE_VERIFY, message="hi")
+
+            with self.assertRaises(frappe.RateLimitExceededError):
+                send_sms(to=PHONE_VERIFY, message="hi")
+
+        # 0 means "no cap", for a trusted backend doing bulk sending
+        with self.change_settings(
+            "TP OTP Settings", {"send_sms_rate_limit_per_hour": 0}
+        ):
+            frappe.clear_cache(doctype="TP OTP Settings")
+            self.assertGreater(get_send_sms_limit(), 1000)
+
+    def test_verify_pays_the_kdf_cost_on_every_failure_path(self):
+        """The failure body is uniform; the latency has to be too, or a guest
+        can time-probe which recipients have a live OTP."""
+        from telephony import otp as otp_module
+
+        recipient = PHONE_ATTEMPTS
+
+        with patch.object(otp_module, "equalize_verify_cost") as mock_equalize:
+            # no row at all
+            otp_module.verify_otp_record(recipient, "SMS", "000000", "Login", 5)
+            self.assertEqual(mock_equalize.call_count, 1)
+
+            # a live row, but the attempt budget is already spent
+            otp_module.create_otp_record(recipient, "SMS", "Login", "123456", 300)
+            frappe.db.set_value(
+                "TP OTP",
+                {"recipient": recipient, "is_verified": 0},
+                "attempts",
+                5,
+            )
+            otp_module.verify_otp_record(recipient, "SMS", "000000", "Login", 5)
+            self.assertEqual(mock_equalize.call_count, 2)
+
+            # an expired row
+            frappe.db.set_value(
+                "TP OTP",
+                {"recipient": recipient, "is_verified": 0},
+                {"attempts": 0, "expires_at": add_to_date(now_datetime(), seconds=-60)},
+            )
+            otp_module.verify_otp_record(recipient, "SMS", "000000", "Login", 5)
+            self.assertEqual(mock_equalize.call_count, 3)
+
     def test_guest_may_call_otp_endpoints_but_not_send_sms(self):
         """Guest access is decided by frappe.is_whitelisted against the exact
         object registered at decoration time. Since normalize_form_field wraps

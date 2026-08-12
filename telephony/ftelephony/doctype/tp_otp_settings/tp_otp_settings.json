@@ -11,6 +11,7 @@
   "enable_email_otp",
   "column_break_enable",
   "sms_from_number",
+  "send_sms_rate_limit_per_hour",
   "section_break_otp",
   "otp_length",
   "otp_expiry_in_seconds",
@@ -48,6 +49,15 @@
    "fieldtype": "Data",
    "label": "SMS From Number",
    "mandatory_depends_on": "eval: doc.enabled"
+  },
+  {
+   "default": "60",
+   "depends_on": "enabled",
+   "description": "Maximum plain SMS one client may send per hour via send_sms. Set to 0 for no limit — do that only when a trusted backend does the sending. OTP endpoints are limited separately, per recipient.",
+   "fieldname": "send_sms_rate_limit_per_hour",
+   "fieldtype": "Int",
+   "label": "Send SMS Rate Limit (per hour)",
+   "non_negative": 1
   },
   {
    "depends_on": "eval: doc.enabled || doc.enable_email_otp",

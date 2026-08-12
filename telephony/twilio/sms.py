@@ -24,6 +24,9 @@ SEND_SAVEPOINT = "tp_dispatch_sms"
 
 ASCII_DIGITS = frozenset("0123456789")
 
+# Stand-in for "no cap" when send_sms_rate_limit_per_hour is 0.
+UNLIMITED_SENDS = 10**9
+
 
 def clean_phone_number(phone_number: str) -> str:
     """Strip everything except ASCII digits and a leading `+`.
@@ -111,9 +114,31 @@ def dispatch_sms(to, message, purpose="General"):
     )
 
 
+def get_send_sms_limit():
+    """Per-hour cap for send_sms, read at request time.
+
+    A hardcoded number would either be too low for a site doing bulk
+    notifications or too high to protect the Twilio balance of one that isn't,
+    so this is configurable, with 0 meaning no limit. ``rate_limit`` accepts a
+    callable for exactly this.
+    """
+    limit = frappe.get_cached_value(
+        "TP OTP Settings", "TP OTP Settings", "send_sms_rate_limit_per_hour"
+    )
+    # 0 disables the cap; the limiter has no "unlimited", so use a ceiling no
+    # single client will reach in one window.
+    return limit or UNLIMITED_SENDS
+
+
 @frappe.whitelist(methods=["POST"])
+@rate_limit(limit=get_send_sms_limit, seconds=60 * 60)
 def send_sms(to: str, message: str):
-    """Send a plain SMS. Restricted to telephony agents/managers."""
+    """Send a plain SMS. Restricted to telephony agents/managers.
+
+    Unlike the OTP endpoints this is rate limited per client rather than per
+    recipient: the risk here is total spend on arbitrary numbers, not repeated
+    hammering of one number.
+    """
     # Defer to the DocType's permissions so the role set stays configurable.
     frappe.has_permission("TP SMS Log", "create", throw=True)
 

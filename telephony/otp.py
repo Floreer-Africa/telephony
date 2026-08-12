@@ -17,8 +17,33 @@ MAX_PURPOSE_LENGTH = 140
 GENERIC_FAILURE = {"verified": False, "reason": "invalid_or_expired"}
 
 
+_DUMMY_HASH = None
+
+
 def generate_otp_code(length: int) -> str:
     return "".join(secrets.choice(string.digits) for _ in range(length))
+
+
+def equalize_verify_cost():
+    """Spend a KDF round on the paths that never reach a real comparison.
+
+    GENERIC_FAILURE makes every failure look alike in the *body*, but not in
+    the clock: only the wrong-code path runs pbkdf2 (~29k rounds), so without
+    this a guest can tell "no live OTP for this recipient" from "there is one"
+    purely by response latency — recovering what the generic reason hides.
+
+    This does not make verification constant-time: the wrong-code path also
+    writes the incremented attempt count, which the others do not. It closes
+    the KDF-sized gap, which is the part big enough to measure over a network.
+    """
+    global _DUMMY_HASH
+
+    from passlib.hash import pbkdf2_sha256
+
+    if _DUMMY_HASH is None:
+        _DUMMY_HASH = pbkdf2_sha256.hash("timing-equalizer")
+
+    pbkdf2_sha256.verify("", _DUMMY_HASH)
 
 
 def clean_purpose(purpose: str) -> str:
@@ -129,6 +154,7 @@ def verify_otp_record(recipient, channel, otp, purpose, max_attempts):
         order_by="creation desc",
     )
     if not otp_name:
+        equalize_verify_cost()
         return dict(GENERIC_FAILURE)
 
     # Locked: reading and incrementing `attempts` is a read-modify-write, so
@@ -137,9 +163,11 @@ def verify_otp_record(recipient, channel, otp, purpose, max_attempts):
     otp_doc = frappe.get_doc(OTP_DOCTYPE, otp_name, for_update=True)
 
     if get_datetime(otp_doc.expires_at) < now_datetime():
+        equalize_verify_cost()
         return dict(GENERIC_FAILURE)
 
     if otp_doc.attempts >= max_attempts:
+        equalize_verify_cost()
         return dict(GENERIC_FAILURE)
 
     if not pbkdf2_sha256.verify(otp, otp_doc.otp_hash):
