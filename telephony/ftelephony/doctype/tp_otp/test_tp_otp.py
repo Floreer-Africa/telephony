@@ -26,7 +26,9 @@ PHONE_BUDGET = "+911234500004"
 PHONE_RESET = "+911234500005"
 PHONE_NORMALIZE = "+911234500006"
 PHONE_REDACT = "+911234500007"
+PHONE_OTHER = "+911234500008"
 TEST_EMAIL = "test-otp@example.com"
+TEST_EMAIL_OTHER = "other-otp@example.com"
 
 TEST_RECIPIENTS = [
     PHONE_VERIFY,
@@ -36,7 +38,9 @@ TEST_RECIPIENTS = [
     PHONE_RESET,
     PHONE_NORMALIZE,
     PHONE_REDACT,
+    PHONE_OTHER,
     TEST_EMAIL,
+    TEST_EMAIL_OTHER,
 ]
 
 
@@ -86,11 +90,32 @@ class IntegrationTestTPOTP(IntegrationTestCase):
         self.addCleanup(settings.__exit__, None, None, None)
         frappe.clear_cache(doctype="TP OTP Settings")
 
+        # Off the request path rate_limit_bucket keeps its own counter in Redis,
+        # which outlives the transaction rollback the rest of this teardown
+        # relies on. Left behind it carries into whatever test runs next.
+        self.addCleanup(frappe.cache.delete_keys, "tp-otp-rl:")
+
         self.addCleanup(self._delete_test_records)
 
     def _delete_test_records(self):
         frappe.db.delete("TP OTP", {"recipient": ["in", TEST_RECIPIENTS]})
         frappe.db.delete("TP SMS Log", {"to": ["in", TEST_RECIPIENTS]})
+
+    def _capture_bucket(self, seen, wrapped=None):
+        """Record the rate-limit bucket while the endpoint is still running.
+
+        call_channel_endpoint restores form_dict on the way out, so the bucket
+        cannot be read after the call — which is the whole point of it, but it
+        means a test has to look from inside.
+        """
+        from telephony.otp import RATE_LIMIT_FIELD
+
+        def side_effect(*args, **kwargs):
+            seen.append(frappe.form_dict.get(RATE_LIMIT_FIELD))
+            if wrapped:
+                return wrapped(*args, **kwargs)
+
+        return side_effect
 
     def _log_sent_sms(self, to, message, purpose="OTP"):
         """Stand in for dispatch_sms, but still write a real TP SMS Log so the
@@ -347,12 +372,21 @@ class IntegrationTestTPOTP(IntegrationTestCase):
         not leave the key *empty*, which makes rate_limit throw its own "Either
         key or IP flag is required" in place of the endpoint's message."""
         from telephony.email_otp import clean_email
-        from telephony.otp import INVALID_RECIPIENT, RATE_LIMIT_FIELD, rate_limit_bucket
+        from telephony.otp import (
+            INVALID_RECIPIENT,
+            RATE_LIMIT_FIELD,
+            RATE_LIMIT_WINDOW,
+            rate_limit_bucket,
+        )
 
         self.addCleanup(frappe.form_dict.pop, "email", None)
         self.addCleanup(frappe.form_dict.pop, RATE_LIMIT_FIELD, None)
 
-        @rate_limit_bucket("email", clean_email, "email:generate")
+        # generous limit: this is asserting the bucket key, not the cap, and off
+        # the request path rate_limit_bucket now enforces the cap itself.
+        @rate_limit_bucket(
+            "email", clean_email, "email:generate", 100, RATE_LIMIT_WINDOW
+        )
         def endpoint(email=None):
             return frappe.form_dict[RATE_LIMIT_FIELD]
 
@@ -878,3 +912,202 @@ class IntegrationTestTPOTP(IntegrationTestCase):
 
         result = send_sms(to=PHONE_VERIFY, message="hi")
         self.assertEqual(result["status"], "Sent")
+
+    @patch("telephony.email_otp.dispatch_email_otp")
+    @patch("telephony.email_otp.generate_otp_code", return_value="777666")
+    def test_send_and_verify_otp_resolve_the_channel(
+        self, mock_generate_code, mock_dispatch_email
+    ):
+        """The entry point other apps use: the same flow the endpoints run,
+        reached with a channel name instead of a channel-specific field."""
+        from telephony.otp import send_otp, verify_otp
+
+        purpose = "Loan Lead LN-LEAD-00001"
+
+        result = send_otp(TEST_EMAIL, "Email", purpose=purpose)
+        self.assertEqual(set(result), {"sent", "expires_in"})
+        mock_dispatch_email.assert_called_once()
+
+        # the purpose scopes the code: the same recipient on the same channel
+        # under another purpose must not match it
+        self.assertEqual(
+            verify_otp(TEST_EMAIL, "Email", "777666", purpose="Verification"),
+            GENERIC_FAILURE,
+        )
+        self.assertEqual(
+            verify_otp(TEST_EMAIL, "Email", "777666", purpose=purpose),
+            {"verified": True},
+        )
+
+    def test_unknown_channel_is_rejected(self):
+        """The channel names a module to import, and callers pass it through
+        from their own request handlers."""
+        from telephony.otp import send_otp, verify_otp
+
+        for channel in ("Carrier Pigeon", "sms", "", None):
+            with self.assertRaises(frappe.ValidationError):
+                send_otp(TEST_EMAIL, channel)
+            with self.assertRaises(frappe.ValidationError):
+                verify_otp(TEST_EMAIL, channel, "777666")
+
+    @patch("telephony.email_otp.dispatch_email_otp")
+    @patch("telephony.email_otp.generate_otp_code", return_value="777666")
+    def test_send_otp_buckets_its_rate_limit_per_recipient(
+        self, mock_generate_code, mock_dispatch_email
+    ):
+        """A server-side caller populates no form_dict, so unless send_otp
+        publishes the recipient there itself, every recipient falls into the
+        shared INVALID_RECIPIENT bucket: five sends to one recipient would then
+        block sends to every other one, and none would be capped on their own."""
+        from telephony.otp import send_otp
+
+        seen = []
+        mock_dispatch_email.side_effect = self._capture_bucket(seen)
+
+        self._drive_rate_limiter("/api/method/telephony.otp.send_otp")
+
+        # limit is 5 per 10 minutes, per recipient
+        for _ in range(5):
+            send_otp(TEST_EMAIL, "Email")
+
+        self.assertEqual(seen[-1], f"email:generate:{TEST_EMAIL}")
+
+        with self.assertRaises(frappe.RateLimitExceededError):
+            send_otp(TEST_EMAIL, "Email")
+
+        # a different recipient keeps a budget of their own
+        send_otp(TEST_EMAIL_OTHER, "Email")
+
+    @patch("telephony.twilio.sms.dispatch_sms")
+    @patch("telephony.twilio.sms.generate_otp_code", return_value="123456")
+    def test_send_and_verify_otp_resolve_the_sms_channel(
+        self, mock_generate_code, mock_dispatch_sms
+    ):
+        """The SMS half of the channel registry: the recipient reaches the
+        endpoint under the field name OTP_CHANNELS claims it takes, so a rename
+        in twilio.sms fails here rather than at a caller."""
+        from telephony.otp import send_otp, verify_otp
+
+        mock_dispatch_sms.side_effect = self._log_sent_sms
+        purpose = "Loan Lead LN-LEAD-00001"
+
+        result = send_otp(PHONE_VERIFY, "SMS", purpose=purpose)
+        self.assertEqual(set(result), {"sent", "expires_in"})
+        mock_dispatch_sms.assert_called_once()
+        self.assertEqual(mock_dispatch_sms.call_args.args[0], PHONE_VERIFY)
+
+        self.assertEqual(
+            verify_otp(PHONE_VERIFY, "SMS", "123456", purpose="Verification"),
+            GENERIC_FAILURE,
+        )
+        self.assertEqual(
+            verify_otp(PHONE_VERIFY, "SMS", "123456", purpose=purpose),
+            {"verified": True},
+        )
+
+    @patch("telephony.twilio.sms.dispatch_sms")
+    @patch("telephony.twilio.sms.generate_otp_code", return_value="123456")
+    def test_send_otp_buckets_its_rate_limit_per_recipient_over_sms(
+        self, mock_generate_code, mock_dispatch_sms
+    ):
+        """Same per-recipient bucketing as the email case, on the channel whose
+        recipient field differs from it — an unset phone_number would put every
+        number in the shared INVALID_RECIPIENT bucket."""
+        from telephony.otp import send_otp
+
+        seen = []
+        mock_dispatch_sms.side_effect = self._capture_bucket(seen, self._log_sent_sms)
+
+        self._drive_rate_limiter("/api/method/telephony.otp.send_otp")
+
+        # limit is 5 per 10 minutes, per recipient
+        for _ in range(5):
+            send_otp(PHONE_VERIFY, "SMS")
+
+        self.assertEqual(seen[-1], f"sms:generate:{PHONE_VERIFY}")
+
+        with self.assertRaises(frappe.RateLimitExceededError):
+            send_otp(PHONE_VERIFY, "SMS")
+
+        # a different recipient keeps a budget of their own
+        send_otp(PHONE_OTHER, "SMS")
+
+    @patch("telephony.email_otp.dispatch_email_otp")
+    @patch("telephony.email_otp.generate_otp_code", return_value="777666")
+    def test_send_otp_leaves_form_dict_as_it_found_it(
+        self, mock_generate_code, mock_dispatch_email
+    ):
+        """form_dict belongs to the caller's request, and send_otp only borrows
+        it to reach the endpoint's rate limiter.
+
+        Left behind, the recipient is PII sitting in a dict frappe writes wholesale
+        into Error Log metadata on any later unhandled exception in the same
+        request — redacted only for credential-looking keys, which 'email' and
+        'phone_number' are not. A caller that posted a document name and nothing
+        else would have leaked that document's contact details on an unrelated
+        failure. It also silently replaced any parameter the caller had under the
+        same name.
+        """
+        from telephony.otp import RATE_LIMIT_FIELD, send_otp
+
+        self.addCleanup(frappe.form_dict.pop, "email", None)
+        self.addCleanup(frappe.form_dict.pop, RATE_LIMIT_FIELD, None)
+
+        # a caller with an 'email' parameter of its own must get it back intact
+        frappe.form_dict.email = "caller-value"
+        send_otp(TEST_EMAIL, "Email")
+        self.assertEqual(frappe.form_dict.email, "caller-value")
+
+        # and one that never had the key must not acquire it
+        frappe.form_dict.pop("email", None)
+        frappe.form_dict.pop(RATE_LIMIT_FIELD, None)
+        send_otp(TEST_EMAIL_OTHER, "Email")
+        self.assertNotIn("email", frappe.form_dict)
+        self.assertNotIn(RATE_LIMIT_FIELD, frappe.form_dict)
+
+    @patch("telephony.email_otp.dispatch_email_otp")
+    @patch("telephony.email_otp.generate_otp_code", return_value="777666")
+    def test_send_otp_is_rate_limited_without_a_request(
+        self, mock_generate_code, mock_dispatch_email
+    ):
+        """frappe's @rate_limit returns early when frappe.request is None, so on
+        a background job — the natural place for an app to dispatch OTPs — the
+        per-recipient cap was not merely wrong but absent."""
+        from telephony.otp import send_otp
+
+        # frappe.request is an unbound LocalProxy here, not None — falsy, which
+        # is exactly what rate_limit and rate_limit_bucket both branch on.
+        self.assertFalse(frappe.request, "this test must run off the request path")
+
+        for _ in range(5):
+            send_otp(TEST_EMAIL, "Email")
+
+        with self.assertRaises(frappe.RateLimitExceededError):
+            send_otp(TEST_EMAIL, "Email")
+
+        # still bucketed per recipient, not one shared counter
+        send_otp(TEST_EMAIL_OTHER, "Email")
+
+    @patch("telephony.twilio.sms.dispatch_sms")
+    @patch("telephony.twilio.sms.generate_otp_code", return_value="123456")
+    def test_non_string_recipient_is_rejected_by_type_not_by_crash(
+        self, mock_generate_code, mock_dispatch_sms
+    ):
+        """A mistyped recipient must fail as a type error, not as an
+        AttributeError from inside the rate-limit decorator.
+
+        The normalizers open on ``.strip()``, and send_otp writes its recipient
+        into form_dict verbatim, so an int looked like it would reach one. It
+        does not: @frappe.whitelist validates annotated arguments and is the
+        outermost decorator, so it rejects the int before rate_limit_bucket
+        runs. Pinned here because that ordering is what makes it safe, and
+        nothing else in the file asserts it.
+        """
+        from telephony.otp import send_otp
+
+        mock_dispatch_sms.side_effect = self._log_sent_sms
+
+        with self.assertRaises(frappe.exceptions.FrappeTypeError):
+            send_otp(911234500001, "SMS")
+
+        mock_dispatch_sms.assert_not_called()

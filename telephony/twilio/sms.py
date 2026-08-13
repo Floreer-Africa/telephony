@@ -5,7 +5,10 @@ from frappe.rate_limiter import rate_limit
 from frappe.utils import now
 
 from telephony.otp import (
+    GENERATE_LIMIT,
     RATE_LIMIT_FIELD,
+    RATE_LIMIT_WINDOW,
+    VERIFY_LIMIT,
     clean_purpose,
     create_otp_record,
     generate_otp_code,
@@ -214,8 +217,19 @@ def send_sms(to: str, message: str):
 # as. Rotating IPs would then buy unlimited SMS to a single number, and the
 # Twilio bill with it.
 @frappe.whitelist(allow_guest=True, methods=["POST"])  # nosemgrep
-@rate_limit_bucket("phone_number", clean_phone_number, "sms:generate")
-@rate_limit(key=RATE_LIMIT_FIELD, limit=5, seconds=10 * 60, ip_based=False)
+@rate_limit_bucket(
+    "phone_number",
+    clean_phone_number,
+    "sms:generate",
+    GENERATE_LIMIT,
+    RATE_LIMIT_WINDOW,
+)
+@rate_limit(
+    key=RATE_LIMIT_FIELD,
+    limit=GENERATE_LIMIT,
+    seconds=RATE_LIMIT_WINDOW,
+    ip_based=False,
+)
 def generate_otp(phone_number: str, purpose: str = "Verification"):
     """Generate an OTP and send it over SMS to the given phone number."""
     settings = get_sms_settings()
@@ -249,8 +263,12 @@ def generate_otp(phone_number: str, purpose: str = "Verification"):
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])  # nosemgrep
-@rate_limit_bucket("phone_number", clean_phone_number, "sms:verify")
-@rate_limit(key=RATE_LIMIT_FIELD, limit=10, seconds=10 * 60, ip_based=False)
+@rate_limit_bucket(
+    "phone_number", clean_phone_number, "sms:verify", VERIFY_LIMIT, RATE_LIMIT_WINDOW
+)
+@rate_limit(
+    key=RATE_LIMIT_FIELD, limit=VERIFY_LIMIT, seconds=RATE_LIMIT_WINDOW, ip_based=False
+)
 def verify_otp(phone_number: str, otp: str, purpose: str = "Verification"):
     """Verify an OTP previously sent to the given phone number."""
     settings = get_sms_settings()

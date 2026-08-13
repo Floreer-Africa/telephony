@@ -6,7 +6,10 @@ from frappe.rate_limiter import rate_limit
 from frappe.utils import split_emails, validate_email_address
 
 from telephony.otp import (
+    GENERATE_LIMIT,
     RATE_LIMIT_FIELD,
+    RATE_LIMIT_WINDOW,
+    VERIFY_LIMIT,
     clean_purpose,
     create_otp_record,
     generate_otp_code,
@@ -85,8 +88,15 @@ def dispatch_email_otp(email, message, subject):
 # a per-(IP, recipient) cap rather than the per-recipient one it is documented
 # as. Rotating IPs would then buy unlimited mail to a single inbox.
 @frappe.whitelist(allow_guest=True, methods=["POST"])  # nosemgrep
-@rate_limit_bucket("email", clean_email, "email:generate")
-@rate_limit(key=RATE_LIMIT_FIELD, limit=5, seconds=10 * 60, ip_based=False)
+@rate_limit_bucket(
+    "email", clean_email, "email:generate", GENERATE_LIMIT, RATE_LIMIT_WINDOW
+)
+@rate_limit(
+    key=RATE_LIMIT_FIELD,
+    limit=GENERATE_LIMIT,
+    seconds=RATE_LIMIT_WINDOW,
+    ip_based=False,
+)
 def generate_otp(email: str, purpose: str = "Verification"):
     """Generate an OTP and send it over email to the given address."""
     settings = get_email_otp_settings()
@@ -112,8 +122,12 @@ def generate_otp(email: str, purpose: str = "Verification"):
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])  # nosemgrep
-@rate_limit_bucket("email", clean_email, "email:verify")
-@rate_limit(key=RATE_LIMIT_FIELD, limit=10, seconds=10 * 60, ip_based=False)
+@rate_limit_bucket(
+    "email", clean_email, "email:verify", VERIFY_LIMIT, RATE_LIMIT_WINDOW
+)
+@rate_limit(
+    key=RATE_LIMIT_FIELD, limit=VERIFY_LIMIT, seconds=RATE_LIMIT_WINDOW, ip_based=False
+)
 def verify_otp(email: str, otp: str, purpose: str = "Verification"):
     """Verify an OTP previously sent to the given email address."""
     settings = get_email_otp_settings()
