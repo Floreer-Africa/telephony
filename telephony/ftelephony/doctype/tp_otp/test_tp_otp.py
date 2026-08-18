@@ -90,9 +90,8 @@ class IntegrationTestTPOTP(IntegrationTestCase):
         self.addCleanup(settings.__exit__, None, None, None)
         frappe.clear_cache(doctype="TP OTP Settings")
 
-        # Off the request path rate_limit_bucket keeps its own counter in Redis,
-        # which outlives the transaction rollback the rest of this teardown
-        # relies on. Left behind it carries into whatever test runs next.
+        # Off the request path the counter lives in Redis, which outlives the
+        # transaction rollback the rest of this teardown relies on.
         self.addCleanup(frappe.cache.delete_keys, "tp-otp-rl:")
 
         self.addCleanup(self._delete_test_records)
@@ -102,12 +101,8 @@ class IntegrationTestTPOTP(IntegrationTestCase):
         frappe.db.delete("TP SMS Log", {"to": ["in", TEST_RECIPIENTS]})
 
     def _capture_bucket(self, seen, wrapped=None):
-        """Record the rate-limit bucket while the endpoint is still running.
-
-        call_channel_endpoint restores form_dict on the way out, so the bucket
-        cannot be read after the call — which is the whole point of it, but it
-        means a test has to look from inside.
-        """
+        """Record the rate-limit bucket while the endpoint is still running:
+        call_channel_endpoint restores form_dict on the way out."""
         from telephony.otp import RATE_LIMIT_FIELD
 
         def side_effect(*args, **kwargs):
@@ -940,8 +935,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
         )
 
     def test_unknown_channel_is_rejected(self):
-        """The channel names a module to import, and callers pass it through
-        from their own request handlers."""
+        """The channel names a module to import, so it is validated first."""
         from telephony.otp import send_otp, verify_otp
 
         for channel in ("Carrier Pigeon", "sms", "", None):
@@ -955,10 +949,8 @@ class IntegrationTestTPOTP(IntegrationTestCase):
     def test_send_otp_buckets_its_rate_limit_per_recipient(
         self, mock_generate_code, mock_dispatch_email
     ):
-        """A server-side caller populates no form_dict, so unless send_otp
-        publishes the recipient there itself, every recipient falls into the
-        shared INVALID_RECIPIENT bucket: five sends to one recipient would then
-        block sends to every other one, and none would be capped on their own."""
+        """Without send_otp publishing the recipient into form_dict, every
+        recipient shares the INVALID_RECIPIENT bucket and one site-wide cap."""
         from telephony.otp import send_otp
 
         seen = []
@@ -983,9 +975,8 @@ class IntegrationTestTPOTP(IntegrationTestCase):
     def test_send_and_verify_otp_resolve_the_sms_channel(
         self, mock_generate_code, mock_dispatch_sms
     ):
-        """The SMS half of the channel registry: the recipient reaches the
-        endpoint under the field name OTP_CHANNELS claims it takes, so a rename
-        in twilio.sms fails here rather than at a caller."""
+        """The SMS half of the registry: the recipient reaches the endpoint
+        under the field name OTP_CHANNELS claims it takes."""
         from telephony.otp import send_otp, verify_otp
 
         mock_dispatch_sms.side_effect = self._log_sent_sms
@@ -1011,8 +1002,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
         self, mock_generate_code, mock_dispatch_sms
     ):
         """Same per-recipient bucketing as the email case, on the channel whose
-        recipient field differs from it — an unset phone_number would put every
-        number in the shared INVALID_RECIPIENT bucket."""
+        recipient field differs from it."""
         from telephony.otp import send_otp
 
         seen = []
@@ -1037,16 +1027,11 @@ class IntegrationTestTPOTP(IntegrationTestCase):
     def test_send_otp_leaves_form_dict_as_it_found_it(
         self, mock_generate_code, mock_dispatch_email
     ):
-        """form_dict belongs to the caller's request, and send_otp only borrows
-        it to reach the endpoint's rate limiter.
+        """form_dict belongs to the caller's request; send_otp only borrows it
+        to reach the endpoint's rate limiter.
 
-        Left behind, the recipient is PII sitting in a dict frappe writes wholesale
-        into Error Log metadata on any later unhandled exception in the same
-        request — redacted only for credential-looking keys, which 'email' and
-        'phone_number' are not. A caller that posted a document name and nothing
-        else would have leaked that document's contact details on an unrelated
-        failure. It also silently replaced any parameter the caller had under the
-        same name.
+        Left behind, the recipient is PII that frappe writes into Error Log
+        metadata on any later unhandled exception in the same request.
         """
         from telephony.otp import RATE_LIMIT_FIELD, send_otp
 
@@ -1071,8 +1056,7 @@ class IntegrationTestTPOTP(IntegrationTestCase):
         self, mock_generate_code, mock_dispatch_email
     ):
         """frappe's @rate_limit returns early when frappe.request is None, so on
-        a background job — the natural place for an app to dispatch OTPs — the
-        per-recipient cap was not merely wrong but absent."""
+        a background job the cap is not merely wrong but absent."""
         from telephony.otp import send_otp
 
         # frappe.request is an unbound LocalProxy here, not None — falsy, which
@@ -1096,12 +1080,9 @@ class IntegrationTestTPOTP(IntegrationTestCase):
         """A mistyped recipient must fail as a type error, not as an
         AttributeError from inside the rate-limit decorator.
 
-        The normalizers open on ``.strip()``, and send_otp writes its recipient
-        into form_dict verbatim, so an int looked like it would reach one. It
-        does not: @frappe.whitelist validates annotated arguments and is the
-        outermost decorator, so it rejects the int before rate_limit_bucket
-        runs. Pinned here because that ordering is what makes it safe, and
-        nothing else in the file asserts it.
+        @frappe.whitelist is the outermost decorator and validates annotated
+        arguments, so it rejects the int before rate_limit_bucket runs. Pinned
+        because that ordering is what makes it safe.
         """
         from telephony.otp import send_otp
 
