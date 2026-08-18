@@ -10,30 +10,24 @@ OTP_DOCTYPE = "TP OTP"
 
 MAX_PURPOSE_LENGTH = 140
 
-# Guest-facing verification failures are deliberately indistinguishable from
-# one another. Reporting "no such OTP" separately from "wrong code" lets an
-# unauthenticated caller enumerate which recipients have a pending OTP and
-# what state it is in.
+# Uniform on purpose: separate reasons would let a guest enumerate which
+# recipients have a pending OTP.
 GENERIC_FAILURE = {"verified": False, "reason": "invalid_or_expired"}
 
-# The form_dict field @rate_limit is pointed at. Always overwritten, never read
-# from the request, so a caller cannot nominate their own bucket.
+# Always overwritten, never read from the request, so a caller cannot
+# nominate their own bucket.
 RATE_LIMIT_FIELD = "tp_rate_limit_key"
 
-# Declared once: rate_limit_bucket enforces the same numbers itself off the
-# request path, so the two enforcement points must not drift apart.
+# Shared by @rate_limit and rate_limit_bucket's own off-request enforcement.
 GENERATE_LIMIT = 5
 VERIFY_LIMIT = 10
 RATE_LIMIT_WINDOW = 10 * 60
 
-# Bucket for any recipient that could not be canonicalized. Neither a valid
-# phone number nor a valid email address, so it can never collide with a real
-# recipient's quota; parking every unusable spelling in one shared bucket is
-# what stops a caller from minting fresh quota by varying the garbage.
+# One shared bucket for every uncanonicalizable recipient, so varying the
+# garbage cannot mint fresh quota. Collides with no real recipient.
 INVALID_RECIPIENT = "invalid"
 
-# Keys are the values stored in TP OTP.channel, so they are also what other
-# apps name a channel by.
+# Keys are the values stored in TP OTP.channel.
 OTP_CHANNELS = {
     "SMS": {"module": "telephony.twilio.sms", "recipient_field": "phone_number"},
     "Email": {"module": "telephony.email_otp", "recipient_field": "email"},
@@ -48,17 +42,8 @@ def generate_otp_code(length: int) -> str:
 
 
 def equalize_verify_cost():
-    """Spend a KDF round on the paths that never reach a real comparison.
-
-    GENERIC_FAILURE makes every failure look alike in the *body*, but not in
-    the clock: only the wrong-code path runs pbkdf2 (~29k rounds), so without
-    this a guest can tell "no live OTP for this recipient" from "there is one"
-    purely by response latency — recovering what the generic reason hides.
-
-    This does not make verification constant-time: the wrong-code path also
-    writes the incremented attempt count, which the others do not. It closes
-    the KDF-sized gap, which is the part big enough to measure over a network.
-    """
+    """Spend a KDF round on the paths that never reach a real comparison, so
+    latency does not leak what GENERIC_FAILURE hides. Not constant-time."""
     global _DUMMY_HASH
 
     from passlib.hash import pbkdf2_sha256
@@ -82,11 +67,7 @@ def clean_purpose(purpose: str) -> str:
 
 
 def enforce_rate_limit(bucket, limit, seconds):
-    """Apply the cap ``@rate_limit`` skips when there is no HTTP request.
-
-    Its own ``tp-otp-rl:`` namespace, since the decorator's key format is not
-    ours to depend on; only ever runs when the decorator declines to.
-    """
+    """Apply the cap ``@rate_limit`` skips when there is no HTTP request."""
     key = frappe.cache.make_key(f"tp-otp-rl:{bucket}:{seconds}")
 
     count = frappe.cache.incrby(key, 1)
@@ -104,43 +85,15 @@ def enforce_rate_limit(bucket, limit, seconds):
 
 
 def rate_limit_bucket(field, normalizer, scope, limit, seconds):
-    """Publish a canonical, endpoint-scoped rate-limit key into ``form_dict``.
-
-    ``@rate_limit`` cannot be pointed straight at the caller's field, for two
-    independent reasons:
-
-    1. It buckets on ``frappe.form_dict[key]`` verbatim, so ``+911234500001``,
-       ``+91 1234500001`` and ``+91-1234500001`` are three buckets for one
-       recipient — a formatting loop would walk straight past the send cap.
-    2. Its cache key is ``rl:{form_dict.cmd}:{identity}:{seconds}``, and only
-       ``/api/v1`` populates ``cmd``. Over ``/api/v2`` it renders as ``None``,
-       so two endpoints sharing a key field and a window collide on a single
-       counter — failed verifies would eat the resend quota and vice versa.
-
-    So normalize the value, qualify it with a per-endpoint ``scope``, and point
-    ``@rate_limit`` at the field written here instead of at the raw one.
-
-    ``normalizer`` runs on unvalidated input and must not throw. Anything it
-    cannot canonicalize lands in the shared ``INVALID_RECIPIENT`` bucket — the
-    endpoint's own validation rejects it a moment later, and the limiter still
-    has a non-empty key to work with (with ``ip_based=False`` an empty one makes
-    ``rate_limit`` throw its own "Either key or IP flag is required" instead).
-
-    The value is coerced to ``str`` first: form_dict does not always hold
-    strings, and the normalizers open on ``.strip()``.
-
-    ``limit`` and ``seconds`` must match the ``@rate_limit`` below it — this
-    enforces them itself on the paths that decorator opts out of.
-
-    Must be applied *above* ``@rate_limit`` so it runs first.
-    """
+    """Publish a canonical, endpoint-scoped rate-limit key into ``form_dict``:
+    ``@rate_limit`` buckets on the raw value and its own key collides across
+    endpoints. Apply above it, with matching ``limit``/``seconds``."""
 
     def decorator(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
             normalized = normalizer(frappe.cstr(frappe.form_dict.get(field)))
-            # Only rewrite the caller's field if they actually sent it; the
-            # bucket is set unconditionally so the limiter is never keyless.
+            # Bucket set unconditionally so the limiter is never keyless.
             if field in frappe.form_dict:
                 frappe.form_dict[field] = normalized
             bucket = f"{scope}:{normalized or INVALID_RECIPIENT}"
@@ -159,32 +112,10 @@ def rate_limit_bucket(field, normalizer, scope, limit, seconds):
 
 def consume_pending_otps(recipient, channel, purpose, max_attempts) -> int:
     """Expire outstanding OTPs for this recipient and return attempts already
-    spent against them.
-
-    ``verify_otp_record`` only ever reads the newest unverified row, and
-    ``attempts`` lives on that row. Without carrying the count forward, each
-    ``generate_otp`` call would hand out a fresh ``otp_max_attempts`` budget
-    against the same short code space. Carrying forward only from *live* rows
-    means the budget still resets naturally once the window lapses.
-
-    Once that carried budget is spent, refuse rather than issue another code.
-    The new row would start at the cap *and* carry a fresh ``expires_at``, so
-    each resend pushed the lockout a full window further out while billing for
-    a code that could never verify — a user who responds to being locked out by
-    retrying, which is the normal response, kept themselves locked out forever.
-    Refusing leaves the live row's expiry untouched, so the lockout drains on
-    its own no matter how often it is retried.
-
-    This does make "locked out" distinguishable from "not", unlike the uniform
-    GENERIC_FAILURE on the verify side. That is accepted: reaching this state
-    requires ``max_attempts`` failed verifies against a live OTP, which a caller
-    can only arrange for a recipient they are already able to target, so it
-    reveals nothing they could not have caused themselves.
-    """
-    # Locked, like the read in verify_otp_record: this is a read-modify-write,
-    # and two concurrent generates would otherwise leave two live OTPs, of which
-    # only the newest can ever verify. Query builder because frappe.get_all has
-    # no way to ask for the lock.
+    spent, so a resend cannot mint a fresh budget. Once it is spent, refuse
+    rather than issue a code that would push the lockout further out."""
+    # Locked: two concurrent generates would otherwise leave two live OTPs, of
+    # which only the newest can verify. Query builder, for for_update().
     otp = frappe.qb.DocType(OTP_DOCTYPE)
     pending = (
         frappe.qb.from_(otp)
@@ -266,9 +197,8 @@ def verify_otp_record(recipient, channel, otp, purpose, max_attempts):
         equalize_verify_cost()
         return dict(GENERIC_FAILURE)
 
-    # Locked: reading and incrementing `attempts` is a read-modify-write, so
-    # concurrent verifies would otherwise share a stale count and collectively
-    # exceed otp_max_attempts.
+    # Locked: concurrent verifies would otherwise share a stale `attempts`
+    # count and collectively exceed otp_max_attempts.
     otp_doc = frappe.get_doc(OTP_DOCTYPE, otp_name, for_update=True)
 
     if get_datetime(otp_doc.expires_at) < now_datetime():
@@ -293,16 +223,13 @@ def verify_otp_record(recipient, channel, otp, purpose, max_attempts):
 
 # --- Entry points for other apps ------------------------------------------
 #
-# telephony.email_otp and telephony.twilio.sms are the *HTTP* API. Server-side
-# callers, which have a channel and a recipient rather than a request, use
-# send_otp / verify_otp below instead of reaching into a channel module.
+# telephony.email_otp and telephony.twilio.sms are the HTTP API; server-side
+# callers use send_otp / verify_otp instead of reaching into a channel module.
 
 
 def get_otp_channel(channel: str) -> dict:
-    """Resolve a channel name against OTP_CHANNELS.
-
-    The name selects a module to import, so it is never taken on trust.
-    """
+    """Resolve a channel name against OTP_CHANNELS. The name selects a module
+    to import, so it is never taken on trust."""
     if channel not in OTP_CHANNELS:
         frappe.throw(
             _("{0} is not a supported OTP channel. Use one of: {1}.").format(
@@ -314,14 +241,9 @@ def get_otp_channel(channel: str) -> dict:
 
 
 def call_channel_endpoint(channel: str, method: str, recipient: str, **kwargs):
-    """Call a channel's OTP endpoint the way an HTTP request to it would.
-
-    The endpoints take their per-recipient rate-limit bucket from
-    ``frappe.form_dict[recipient_field]``, which a server-side caller has not
-    populated, so publish the recipient there first — then put form_dict back
-    the way it was found: it belongs to the caller's request, and frappe writes
-    it wholesale into Error Log metadata on any later unhandled exception.
-    """
+    """Call a channel's OTP endpoint the way an HTTP request would: they bucket
+    their rate limit on ``form_dict[recipient_field]``, so publish the recipient
+    there, then restore form_dict — it belongs to the caller's request."""
     config = get_otp_channel(channel)
     field = config["recipient_field"]
     endpoint = frappe.get_attr(f"{config['module']}.{method}")
@@ -343,31 +265,19 @@ def call_channel_endpoint(channel: str, method: str, recipient: str, **kwargs):
 
 
 def send_otp(recipient: str, channel: str, purpose: str = "Verification") -> dict:
-    """Generate an OTP and deliver it to ``recipient`` over ``channel``.
-
-    Returns ``{"sent": True, "expires_in": <seconds>}``, or raises. The code
-    itself is never returned, on any path.
-
-    ``purpose`` scopes the OTP — a code only matches the recipient, channel and
-    purpose it was issued for, so callers verifying a specific record should
-    name that record in the purpose.
-    """
+    """Generate an OTP and deliver it to ``recipient`` over ``channel``; the
+    code is never returned. ``purpose`` scopes the OTP, so callers verifying a
+    specific record should name that record in it."""
     return call_channel_endpoint(channel, "generate_otp", recipient, purpose=purpose)
 
 
 def verify_otp(
     recipient: str, channel: str, otp: str, purpose: str = "Verification"
 ) -> dict:
-    """Verify an OTP previously sent to ``recipient`` over ``channel``.
-
-    A failed verification is the only thing returned as a value
-    (``GENERIC_FAILURE``); an unsupported or disabled channel, an unusable
-    recipient and the rate limit all raise, so callers must handle both.
-
-    Callers must not raise on a failure result either: the failed attempt is
-    recorded against the OTP, and rolling that increment back with the request
-    would leave ``otp_max_attempts`` toothless.
-    """
+    """Verify an OTP previously sent to ``recipient`` over ``channel``. A failed
+    verification is the only thing returned as a value — a bad channel, an
+    unusable recipient and the rate limit all raise — and callers must not turn
+    that value into a raise, which would roll back the recorded attempt."""
     return call_channel_endpoint(
         channel, "verify_otp", recipient, otp=otp, purpose=purpose
     )
